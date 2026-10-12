@@ -162,6 +162,21 @@ static NSString *WTEP_FindDiagPath(void) {
     return nil;
 }
 
+// 阳性对照文件（由 SpringBoard 进程写入）
+static NSString *WTEP_FindSpringBoardMarker(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *cands = [NSMutableArray array];
+    [cands addObject:@"/var/mobile/Media/WeTypeEnhance/springboard.txt"];
+    for (NSString *p in WTEP_DiagSearchPaths()) {
+        [cands addObject:[[p stringByDeletingLastPathComponent]
+                          stringByAppendingPathComponent:@"springboard.txt"]];
+    }
+    for (NSString *p in cands) {
+        if ([fm fileExistsAtPath:p]) return p;
+    }
+    return nil;
+}
+
 #pragma mark - 主控制器
 
 @interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate, PHPickerViewControllerDelegate>
@@ -463,7 +478,25 @@ static NSString *WTEP_FindDiagPath(void) {
 - (void)openDiagReport:(PSSpecifier *)spec {
     NSString *path = WTEP_FindDiagPath();
     if (!path) {
-        // 列出已检查的位置，便于判断到底是「没注入」还是「写不进去」
+        // 没有键盘进程报告时，退而求其次看阳性对照（SpringBoard 注入标记）
+        NSString *sb = WTEP_FindSpringBoardMarker();
+        if (sb) {
+            NSString *sbText = [NSString stringWithContentsOfFile:sb encoding:NSUTF8StringEncoding error:nil] ?: @"";
+            NSString *head = [NSString stringWithFormat:
+                @"【阳性对照】\n注入机制本身是通的（SpringBoard 已成功注入并写入文件）：\n%@\n\n"
+                 "但键盘进程没有生成报告 → 说明插件没被加载进微信输入法键盘进程。\n"
+                 "可能原因：过滤规则里的 Bundle ID / 进程名与你这个输入法版本不一致。\n\n"
+                 "────── 原始内容 ──────\n", sb];
+            WTEDiagViewController *vc = [WTEDiagViewController new];
+            vc.reportText = [head stringByAppendingString:sbText];
+            vc.reportPath = sb;
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+            nav.modalPresentationStyle = UIModalPresentationPageSheet;
+            [self presentViewController:nav animated:YES completion:nil];
+            return;
+        }
+
+        // 连对照都没有 → 注入机制或写文件通道有问题
         NSArray *checked = WTEP_DiagSearchPaths();
         NSMutableString *list = [NSMutableString string];
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -476,9 +509,12 @@ static NSString *WTEP_FindDiagPath(void) {
             shown++;
         }
         NSString *msg = [NSString stringWithFormat:
-            @"未找到诊断报告，共检查 %lu 个位置：\n\n%@\n\n可能原因：\n1) 插件没注入进键盘进程\n2) 键盘进程沙盒禁止写文件\n\n请先确认：去微信调出键盘打几个字，键盘有没有变成「橙色背景 + 红色按键」？\n· 变红 → 注入和 hook 正常，只是读写文件被沙盒拦了\n· 没变 → 注入没成功",
+            @"连阳性对照（SpringBoard 标记）都没有。\n\n"
+             "这说明插件的文件写入通道或注入机制本身没生效，和微信输入法无关。\n"
+             "（注意：修改设置后需要注销/重启一次）\n\n"
+             "已检查 %lu 个位置：\n%@",
             (unsigned long)checked.count, list];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没有诊断报告"
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没有任何报告"
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
