@@ -831,9 +831,65 @@ static void WTE_Init(void) {
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
                                                    attributes:nil error:nil];
-        NSString *msg = [NSString stringWithFormat:
+
+        NSMutableString *msg = [NSMutableString stringWithFormat:
             @"SpringBoard 注入成功（阳性对照）\npid=%d\nhome=%@\ntime=%@\n",
             getpid(), NSHomeDirectory(), [NSDate date]];
+
+        // —— 枚举系统里微信输入法 App 与其扩展的真实标识 ——
+        // 这是把「过滤规则匹配不上」变成「拿到真实 Bundle ID / 进程名」的关键。
+        @try {
+            Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
+            id ws = ((id (*)(id, SEL))objc_msgSend)(wsClass, NSSelectorFromString(@"defaultWorkspace"));
+            NSArray *apps = ((id (*)(id, SEL))objc_msgSend)(ws, NSSelectorFromString(@"installedApplications"));
+            [msg appendFormat:@"\n===== 系统内 tencent/wetype 相关应用 %lu 个 =====\n", (unsigned long)apps.count];
+            for (id app in apps) {
+                @try {
+                    NSString *bid = nil;
+                    @try { bid = [app valueForKey:@"applicationIdentifier"]; } @catch (__unused NSException *e) {}
+                    if (![bid isKindOfClass:[NSString class]]) continue;
+                    NSString *low = [bid lowercaseString];
+                    if (![low containsString:@"tencent"] && ![low containsString:@"wetype"]) continue;
+
+                    NSBundle *b = nil;
+                    @try {
+                        NSURL *url = [app valueForKey:@"bundleURL"];
+                        if ([url isKindOfClass:[NSURL class]]) b = [NSBundle bundleWithURL:url];
+                    } @catch (__unused NSException *e) {}
+                    [msg appendFormat:@"\nAPP  %@\n", bid];
+                    if (b) {
+                        [msg appendFormat:@"  版本=%@ 显示名=%@\n",
+                            b.infoDictionary[@"CFBundleShortVersionString"] ?: @"?",
+                            b.infoDictionary[@"CFBundleDisplayName"] ?: @"?"];
+                        [msg appendFormat:@"  路径=%@\n", b.bundlePath];
+                    }
+                    NSArray *plugins = nil;
+                    @try { plugins = [app valueForKey:@"plugInKitPlugins"]; } @catch (__unused NSException *e) {}
+                    [msg appendFormat:@"  扩展数=%lu\n", (unsigned long)plugins.count];
+                    for (id plugin in plugins) {
+                        [msg appendFormat:@"  [扩展] %@\n", plugin];   // description 通常带全部键
+                        NSURL *purl = nil;
+                        for (NSString *k in @[@"pluginBundleURL", @"bundleURL", @"URL"]) {
+                            @try {
+                                id v = [plugin valueForKey:k];
+                                if ([v isKindOfClass:[NSURL class]]) { purl = v; break; }
+                            } @catch (__unused NSException *e) {}
+                        }
+                        if (purl) {
+                            NSBundle *pb = [NSBundle bundleWithURL:purl];
+                            [msg appendFormat:@"    BundleID=%@ Exec=%@\n",
+                                pb.infoDictionary[@"CFBundleIdentifier"] ?: @"?",
+                                pb.infoDictionary[@"CFBundleExecutable"] ?: @"?"];
+                        }
+                    }
+                } @catch (NSException *e) {
+                    [msg appendFormat:@"  遍历异常: %@\n", e];
+                }
+            }
+        } @catch (NSException *e) {
+            [msg appendFormat:@"Workspace 枚举失败: %@\n", e];
+        }
+
         BOOL ok1 = [msg writeToFile:[dir stringByAppendingPathComponent:@"springboard.txt"]
                          atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSString *ownDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WeTypeEnhance"];
@@ -871,7 +927,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.5.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.6.0 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好可读性检查 ---");
     for (NSString *p in WTE_PrefCandidates()) {
