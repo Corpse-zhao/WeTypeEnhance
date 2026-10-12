@@ -1,9 +1,16 @@
-{
-    Filter = {
-        Bundles = (
-            "com.tencent.wetype.keyboard",
-            "com.tencent.xin.keyboard",
-            "com.tencent.wetype"
-        );
-    };
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  注入范围故意留空 = 注入所有进程。
+  原因：微信输入法的键盘扩展 Bundle ID / 进程名随版本变化，写死会导致插件
+  完全不加载（表现为「设置里能开，键盘毫无反应，也生成不了诊断报告」）。
+  真正的门禁在 Tweak.x 的 WTE_Init 里：非微信输入法进程立即 return，
+  不扫描类、不 hook、不写任何文件。
+  等诊断报告确认了真实 Bundle ID，再改回精确过滤。
+-->
+<plist version="1.0">
+<dict>
+    <key>Filter</key>
+    <dict/>
+</dict>
+</plist>

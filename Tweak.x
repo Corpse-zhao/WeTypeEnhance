@@ -128,24 +128,61 @@ static dispatch_queue_t gDiagQueue;
 static BOOL gDiagFlushedClassScan = NO;
 static NSMutableSet *gLayoutSeen;
 
+static NSArray *WTE_DiagDirs(void) {
+    NSMutableArray *dirs = [NSMutableArray array];
+    // 1) 全局可写位置
+    [dirs addObject:@"/var/mobile/Media/WeTypeEnhance"];
+    [dirs addObject:@"/var/mobile/Library/Application Support/WeTypeEnhance"];
+    // 2) 当前进程自己的容器（扩展容器一定可写）
+    NSString *home = NSHomeDirectory();
+    if (home.length) {
+        [dirs addObject:[home stringByAppendingPathComponent:@"Documents/WeTypeEnhance"]];
+        [dirs addObject:[home stringByAppendingPathComponent:@"tmp/WeTypeEnhance"]];
+    }
+    // 3) 微信输入法相关的 App Group 共享容器（导入导出组）
+    NSString *shared = @"/var/mobile/Containers/Shared/AppGroup";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *subs = [fm contentsOfDirectoryAtPath:shared error:nil];
+    for (NSString *sub in subs) {
+        NSString *base = [shared stringByAppendingPathComponent:sub];
+        NSString *meta = [base stringByAppendingPathComponent:
+                          @".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:meta];
+        NSString *gid = m[@"MCMMetadataIdentifier"];
+        if (![gid isKindOfClass:[NSString class]]) continue;
+        if ([gid containsString:@"tencent"] || [gid containsString:@"wetype"] ||
+            [gid containsString:@"xin"] || [gid containsString:@"wechat"]) {
+            [dirs addObject:base];
+        }
+    }
+    return dirs;
+}
+
 static void WTE_DiagFlush(NSString *tag) {
     if (!gDiag) return;
-    NSString *content = [gDiag copy];
-    NSArray *dirs = @[
-        @"/var/mobile/Library/Application Support/WeTypeEnhance",
-        @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance",
-        @"/var/mobile/Media/WeTypeEnhance",
-    ];
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *dir in dirs) {
+    NSMutableArray *ok = [NSMutableArray array];
+    for (NSString *dir in WTE_DiagDirs()) {
+        NSString *target = [dir hasSuffix:@"AppGroup"] || [dir containsString:@"AppGroup/"]
+                         ? [dir stringByAppendingPathComponent:@"WeTypeEnhance"]
+                         : dir;
         NSError *e = nil;
-        if (![fm fileExistsAtPath:dir]) {
-            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&e];
+        if (![fm fileExistsAtPath:target]) {
+            [fm createDirectoryAtPath:target withIntermediateDirectories:YES attributes:nil error:&e];
         }
-        if (![fm fileExistsAtPath:dir]) continue;
-        NSString *dest = [dir stringByAppendingPathComponent:@"diag.txt"];
-        [content writeToFile:dest atomically:YES encoding:NSUTF8StringEncoding error:&e];
+        if (![fm fileExistsAtPath:target]) continue;
+        NSString *dest = [target stringByAppendingPathComponent:@"diag.txt"];
+        // 两段式：先写正文，成功则记下该路径
+        if ([gDiag writeToFile:dest atomically:YES encoding:NSUTF8StringEncoding error:&e]) {
+            [ok addObject:dest];
+        }
     }
+    // 把成功写入的路径补进正文（下次 flush 生效），便于确认哪条通道可用
+    if (ok.count) {
+        [gDiag appendFormat:@"=== 已成功写入 %lu 处 ===\n", (unsigned long)ok.count];
+        for (NSString *p in ok) [gDiag appendFormat:@"  wrote %@\n", p];
+    }
+    WTE_Diag(@"flush(%@) 成功 %lu 处", tag, (unsigned long)ok.count);
 }
 
 static void WTE_Diag(NSString *fmt, ...) {
@@ -778,6 +815,26 @@ static int WTE_ScanAndHookClasses(void) {
 
 __attribute__((constructor))
 static void WTE_Init(void) {
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *bundleID = [bundle bundleIdentifier] ?: @"";
+    NSString *execName = [[NSProcessInfo processInfo] processName] ?: @"";
+
+    // —— 进程白名单 ——
+    // 过滤 plist 已放宽到「注入所有进程」，这里做严格门禁：
+    // 只有看起来是微信输入法（或进程里已注册 WB* 类）才继续，其它进程直接返回。
+    NSString *lower = [[NSString stringWithFormat:@"%@ %@", bundleID, execName] lowercaseString];
+    BOOL isWeType = NO;
+    for (NSString *kw in @[@"wetype", @"wxkb", @"xin.keyboard", @"wechatkb", @"wetype.keyboard"]) {
+        if ([lower containsString:kw]) { isWeType = YES; break; }
+    }
+    if (!isWeType) {
+        // 兜底：进程里已存在 WB 开头的类（微信输入法的类名前缀）
+        for (NSString *cn in @[@"WBKeyboardView", @"WBKeyView", @"WBRootInputView", @"WBMainInputView"]) {
+            if (NSClassFromString(cn)) { isWeType = YES; break; }
+        }
+    }
+    if (!isWeType) return;
+
     gPrefQueue = dispatch_queue_create("com.colorblack.wetypeenhance.prefs", DISPATCH_QUEUE_SERIAL);
 #if WTE_LOG_ENABLE
     gDiagQueue = dispatch_queue_create("com.colorblack.wetypeenhance.diag", DISPATCH_QUEUE_SERIAL);
@@ -786,14 +843,10 @@ static void WTE_Init(void) {
     gOrigLayout = [NSMutableDictionary new];
     gOrigMove = [NSMutableDictionary new];
 
-    NSBundle *bundle = [NSBundle mainBundle];
-    NSString *bundleID = [bundle bundleIdentifier];
-    NSString *execName = [[NSProcessInfo processInfo] processName];
-
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.1.0 ================");
-    WTE_Diag(@"pid=%d bundle=%@ exec=%@", getpid(), bundleID, execName);
+    WTE_Diag(@"================ WeTypeEnhance v1.4.0 ================");
+    WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好可读性检查 ---");
     for (NSString *p in WTE_PrefCandidates()) {
         BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:p];
@@ -804,8 +857,12 @@ static void WTE_Init(void) {
     WTE_Diag(@"  enabled=%d bgEnabled=%d bgMode=%@ keyColorEnabled=%d skinEnabled=%d kbOffset=%.1f",
              gConfig.enabled, gConfig.bgEnabled, gConfig.bgMode,
              gConfig.keyColorEnabled, gConfig.skinEnabled, gConfig.kbOffset);
-    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
-    WTE_Diag(@"  raw prefs = %@", raw);
+    WTE_Diag(@"  raw prefs = %@", [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()]);
+    WTE_Diag(@"--- App Group 容器 ---");
+    for (NSString *d in WTE_DiagDirs()) WTE_Diag(@"  dir %@", d);
+
+    // 立刻写一次：证明本进程确实注入了（不依赖类扫描成功）
+    WTE_DiagFlush(@"init");
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,

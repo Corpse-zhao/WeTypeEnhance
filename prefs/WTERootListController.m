@@ -107,16 +107,57 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 
 @end
 
-// 在候选路径里找诊断文件
-static NSString *WTEP_FindDiagPath(void) {
-    NSArray *paths = @[
-        @"/var/mobile/Media/WeTypeEnhance/diag.txt",
-        @"/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
-        @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
-    ];
+// 在候选路径里找诊断文件（含键盘扩展容器、App Group 共享容器）
+static NSArray *WTEP_DiagSearchPaths(void) {
+    NSMutableArray *paths = [NSMutableArray array];
+    [paths addObject:@"/var/mobile/Media/WeTypeEnhance/diag.txt"];
+    [paths addObject:@"/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt"];
+
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *p in paths) {
-        if ([fm fileExistsAtPath:p]) return p;
+
+    // 插件容器（键盘扩展的数据容器就在这里）
+    NSString *pk = @"/var/mobile/Containers/Data/PluginKitPlugin";
+    for (NSString *sub in [fm contentsOfDirectoryAtPath:pk error:nil]) {
+        NSString *base = [pk stringByAppendingPathComponent:sub];
+        for (NSString *rel in @[@"Documents/WeTypeEnhance/diag.txt",
+                                @"tmp/WeTypeEnhance/diag.txt",
+                                @"Library/Application Support/WeTypeEnhance/diag.txt"]) {
+            [paths addObject:[base stringByAppendingPathComponent:rel]];
+        }
+    }
+
+    // App Group 共享容器
+    NSString *shared = @"/var/mobile/Containers/Shared/AppGroup";
+    for (NSString *sub in [fm contentsOfDirectoryAtPath:shared error:nil]) {
+        NSString *base = [shared stringByAppendingPathComponent:sub];
+        NSString *meta = [base stringByAppendingPathComponent:
+                          @".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:meta];
+        NSString *gid = m[@"MCMMetadataIdentifier"];
+        if (![gid isKindOfClass:[NSString class]]) continue;
+        if ([gid containsString:@"tencent"] || [gid containsString:@"wetype"] ||
+            [gid containsString:@"xin"] || [gid containsString:@"wechat"]) {
+            [paths addObject:[base stringByAppendingPathComponent:@"WeTypeEnhance/diag.txt"]];
+        }
+    }
+
+    // 普通 App 容器（万一键盘跑在主 App 里）
+    NSString *app = @"/var/mobile/Containers/Data/Application";
+    for (NSString *sub in [fm contentsOfDirectoryAtPath:app error:nil]) {
+        NSString *base = [app stringByAppendingPathComponent:sub];
+        [paths addObject:[base stringByAppendingPathComponent:@"Documents/WeTypeEnhance/diag.txt"]];
+        [paths addObject:[base stringByAppendingPathComponent:@"tmp/WeTypeEnhance/diag.txt"]];
+    }
+    return paths;
+}
+
+static NSString *WTEP_FindDiagPath(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in WTEP_DiagSearchPaths()) {
+        if ([fm fileExistsAtPath:p]) {
+            NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+            if ([attr fileSize] > 0) return p;
+        }
     }
     return nil;
 }
@@ -240,7 +281,11 @@ static NSString *WTEP_FindDiagPath(void) {
 - (NSArray *)buildSpecifiers {
     NSMutableArray *specs = [NSMutableArray array];
 
-    [specs addObject:[self group:@"微信输入法增强 v1.2.0\n功能对等移植自「原生输入法增强」"]];
+    // 版本号从 bundle 读，避免写死后与实际包版本不一致
+    NSString *ver = [[NSBundle bundleForClass:[self class]]
+                     objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    [specs addObject:[self group:[NSString stringWithFormat:
+        @"微信输入法增强 v%@\n功能对等移植自「原生输入法增强」", ver]]];
     [specs addObject:[self switchRow:@"启用" key:kKeyEnabled def:YES]];
 
     // ---- 1. 键盘背景 ----
@@ -418,10 +463,24 @@ static NSString *WTEP_FindDiagPath(void) {
 - (void)openDiagReport:(PSSpecifier *)spec {
     NSString *path = WTEP_FindDiagPath();
     if (!path) {
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"还没有诊断报告"
-                             message:@"插件会在微信输入法的键盘进程里生成报告。\n\n请先：\n1. 去微信随便打开一个聊天，调出微信输入法键盘，打几个字\n2. 回到这里点「生成诊断报告」\n\n如果仍然没有报告，说明插件没有注入进键盘进程（问题在注入层）。\n注意：修改设置后需要注销重进一次设置。"
-                      preferredStyle:UIAlertControllerStyleAlert];
+        // 列出已检查的位置，便于判断到底是「没注入」还是「写不进去」
+        NSArray *checked = WTEP_DiagSearchPaths();
+        NSMutableString *list = [NSMutableString string];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSUInteger shown = 0;
+        for (NSString *p in checked) {
+            if (shown >= 8) { [list appendString:@"  …\n"]; break; }
+            NSString *dir = [p stringByDeletingLastPathComponent];
+            BOOL dirExists = [fm fileExistsAtPath:dir];
+            [list appendFormat:@"%@ %@\n", dirExists ? @"[目录在]" : @"[无目录]", p];
+            shown++;
+        }
+        NSString *msg = [NSString stringWithFormat:
+            @"未找到诊断报告，共检查 %lu 个位置：\n\n%@\n\n可能原因：\n1) 插件没注入进键盘进程\n2) 键盘进程沙盒禁止写文件\n\n请先确认：去微信调出键盘打几个字，键盘有没有变成「橙色背景 + 红色按键」？\n· 变红 → 注入和 hook 正常，只是读写文件被沙盒拦了\n· 没变 → 注入没成功",
+            (unsigned long)checked.count, list];
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没有诊断报告"
+                                                                  message:msg
+                                                           preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
         return;
