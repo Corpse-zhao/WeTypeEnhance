@@ -823,6 +823,28 @@ static void WTE_Init(void) {
     NSString *bundleID = [bundle bundleIdentifier] ?: @"";
     NSString *execName = [[NSProcessInfo processInfo] processName] ?: @"";
 
+    // —— 阳性对照：SpringBoard ——
+    // 在 SpringBoard 里只写一个标记文件就退出，用来验证「注入机制 + 文件写入通道」
+    // 是否正常。若这个文件都没有，说明注入层/写文件通道有问题，与微信输入法无关。
+    if ([bundleID isEqualToString:@"com.apple.springboard"]) {
+        NSString *dir = @"/var/mobile/Media/WeTypeEnhance";
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil error:nil];
+        NSString *msg = [NSString stringWithFormat:
+            @"SpringBoard 注入成功（阳性对照）\npid=%d\nhome=%@\ntime=%@\n",
+            getpid(), NSHomeDirectory(), [NSDate date]];
+        BOOL ok1 = [msg writeToFile:[dir stringByAppendingPathComponent:@"springboard.txt"]
+                         atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSString *ownDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WeTypeEnhance"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:ownDir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        BOOL ok2 = [msg writeToFile:[ownDir stringByAppendingPathComponent:@"springboard.txt"]
+                         atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSLog(@"[WeTypeEnhance] SpringBoard 对照写入 Media=%d container=%d", ok1, ok2);
+        return;
+    }
+
     // —— 进程白名单 ——
     // 过滤 plist 已放宽到「注入所有进程」，这里做严格门禁：
     // 只有看起来是微信输入法（或进程里已注册 WB* 类）才继续，其它进程直接返回。
@@ -849,7 +871,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.4.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.5.0 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好可读性检查 ---");
     for (NSString *p in WTE_PrefCandidates()) {
