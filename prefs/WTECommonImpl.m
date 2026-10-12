@@ -72,15 +72,18 @@ id WTE_GetPref(NSString *key) {
 
 void WTE_SetPref(NSString *key, id value) {
     if (!key) return;
-    NSString *path = WTEP_PrefPath();
-    NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
-    if (!dict) dict = [NSMutableDictionary dictionary];
-    if (value == nil) {
-        [dict removeObjectForKey:key];
-    } else {
-        dict[key] = value;
+    // 所有候选路径都写一份，保证 tweak 无论从哪个路径读都能读到
+    NSArray *paths = @[
+        @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
+        @"/var/jb/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
+    ];
+    for (NSString *path in paths) {
+        NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
+        if (!dict) dict = [NSMutableDictionary dictionary];
+        if (value == nil) [dict removeObjectForKey:key];
+        else dict[key] = value;
+        [dict writeToFile:path atomically:YES];
     }
-    [dict writeToFile:path atomically:YES];
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
     if (value == nil) [ud removeObjectForKey:key];
     else [ud setObject:value forKey:key];

@@ -87,12 +87,14 @@ id WTE_GetPref(NSString *key) {
 
 void WTE_SetPref(NSString *key, id value) {
     if (!key) return;
-    NSString *path = WTE_PrefPath();
-    NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
-    if (!dict) dict = [NSMutableDictionary dictionary];
-    if (value == nil) [dict removeObjectForKey:key];
-    else dict[key] = value;
-    [dict writeToFile:path atomically:YES];
+    // 所有候选路径都写一份，读哪份都能读到
+    for (NSString *path in WTE_PrefCandidates()) {
+        NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
+        if (!dict) dict = [NSMutableDictionary dictionary];
+        if (value == nil) [dict removeObjectForKey:key];
+        else dict[key] = value;
+        [dict writeToFile:path atomically:YES];
+    }
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
     if (value == nil) [ud removeObjectForKey:key];
     else [ud setObject:value forKey:key];
@@ -206,6 +208,32 @@ static void WTE_DiagFlush(NSString *tag) {}
 
 + (instancetype)loadConfig {
     WTEConfig *c = [WTEConfig new];
+
+    // —— 诊断模式 ——
+    // 如果偏好完全读不到（空字典），强制套用一套高对比测试主题：
+    //   键盘橙色背景 + 按键红色。
+    // 键盘变红橙 → 注入/hook 全通，问题是「偏好读不到」（沙盒），换存储方案即可
+    // 键盘没变化 → 注入或类扫描问题，需要 diag.txt
+    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
+    BOOL prefsReadable = raw.count > 0;
+    if (!prefsReadable) {
+        c.enabled = YES;
+        c.bgEnabled = YES;
+        c.bgMode = @"solid";
+        c.bgColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.0 alpha:1.0];
+        c.bgAlpha = 1.0;
+        c.keyColorEnabled = YES;
+        c.keyLetterBg = [UIColor colorWithRed:0.95 green:0.1 blue:0.1 alpha:1.0];
+        c.keyDigitBg  = [UIColor colorWithRed:0.95 green:0.5 blue:0.1 alpha:1.0];
+        c.keyFuncLeftBg = [UIColor darkGrayColor];
+        c.keyFuncRightBg = [UIColor darkGrayColor];
+        c.keySpaceBg = [UIColor colorWithRed:0.95 green:0.1 blue:0.1 alpha:1.0];
+        c.keyTextColor = [UIColor whiteColor];
+        c.keyShape = @"rounded";
+        c.keyCornerRadius = 6.0;
+        WTE_Diag(@"!!! 偏好不可读，进入强制测试主题模式（键盘应为橙底红键）");
+        return c;
+    }
 
     c.enabled = WTE_BoolPref(kKeyEnabled, YES);
     if (!c.enabled) return c;
