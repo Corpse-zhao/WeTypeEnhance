@@ -2,12 +2,59 @@
 // 微信输入法增强 —— 偏好设置面板
 // 完整图形界面：开关 / 滑块 / 取色器 / 相册选图 / 预设 / 重置
 
-#import <Preferences/PSListController.h>
-#import <Preferences/PSSpecifier.h>
-#import <Preferences/PSTableCell.h>
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
 #import "../WeTypeEnhanceCommon.h"
+
+// ---- Preferences 私有框架自声明 ----
+// iOS SDK 不含 Preferences.framework 的头文件与 .tbd，且 roothide theos 的
+// vendor/include 里不一定有副本。这里只声明用到的部分，链接期用
+// -Wl,-undefined,dynamic_lookup 交给运行时解析（符号由设置 App 提供）。
+
+typedef NS_ENUM(NSInteger, PSCellType) {
+    PSGroupCell       = 0,
+    PSLinkCell        = 1,
+    PSLinkListCell    = 2,
+    PSListItemCell    = 3,
+    PSTitleValueCell  = 4,
+    PSSliderCell      = 5,
+    PSSwitchCell      = 6,
+    PSStaticTextCell  = 7,
+    PSButtonCell      = 8,
+    PSRadioGroupCell  = 9,
+    PSControlGroupCell = 10,
+};
+
+@interface PSSpecifier : NSObject
++ (instancetype)preferenceSpecifierNamed:(NSString *)name
+                                  target:(id)target
+                                     set:(SEL)set
+                                     get:(SEL)get
+                                  detail:(Class)detail
+                                    cell:(PSCellType)cell
+                                    edit:(Class)edit;
++ (instancetype)groupSpecifierWithName:(NSString *)name;
+- (void)setProperty:(id)value forKey:(NSString *)key;
+- (id)propertyForKey:(NSString *)key;
+- (void)setButtonAction:(SEL)action;
+- (void)setTarget:(id)target;
+@end
+
+@interface PSTableCell : UITableViewCell
+@property (nonatomic, strong) id specifier;
+- (instancetype)initWithStyle:(UITableViewCellStyle)style
+              reuseIdentifier:(NSString *)reuseIdentifier
+                    specifier:(PSSpecifier *)specifier;
+- (void)refreshCellContentsWithSpecifier:(PSSpecifier *)specifier;
+@end
+
+@interface PSListController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, retain) NSArray *specifiers;
+- (NSArray *)specifiers;
+- (PSSpecifier *)specifierAtIndexPath:(NSIndexPath *)indexPath;
+- (void)reloadSpecifiers;
+- (void)reloadSpecifier:(PSSpecifier *)spec;
+@end
 
 #pragma mark - 自定义取色单元格
 
