@@ -15,6 +15,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
@@ -61,25 +62,88 @@ NSString *WTE_HexFromColor(UIColor *color) {
             (int)round(r * 255), (int)round(g * 255), (int)round(b * 255), (int)round(a * 255)];
 }
 
+// ---------- 偏好通道（v1.7.0 多通道） ----------
+// 键盘扩展跑在独立沙盒里（PluginKitPlugin 容器），直读 /var/mobile/Library/Preferences
+// 有可能被沙盒拦掉。因此面板会把同一份配置复制到多个「键盘扩展读得到」的位置，
+// 这里按「文件修改时间最新者优先」挑一份用 —— 比固定优先级更抗部分写入失败。
+static NSString *WTEPref_HomePath(NSString *rel) {
+    NSString *home = NSHomeDirectory();
+    return home.length ? [home stringByAppendingPathComponent:rel] : nil;
+}
+
 static NSArray *WTE_PrefCandidates(void) {
-    return @[
-        @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
-        @"/var/jb/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
-    ];
+    NSMutableArray *a = [NSMutableArray array];
+    NSString *p = nil;
+    // 1) 本进程自己的容器（键盘扩展一定可读）
+    if ((p = WTEPref_HomePath(@"Documents/WeTypeEnhance/config.plist"))) [a addObject:p];
+    if ((p = WTEPref_HomePath(@"Library/Application Support/WeTypeEnhance/config.plist"))) [a addObject:p];
+    if ((p = WTEPref_HomePath(@"Library/Preferences/com.colorblack.wetypeenhance.plist"))) [a addObject:p];
+    // 2) 全局可写位置
+    [a addObject:@"/var/mobile/Library/Application Support/WeTypeEnhance/config.plist"];
+    [a addObject:@"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/config.plist"];
+    [a addObject:@"/var/mobile/Media/WeTypeEnhance/config.plist"];
+    // 3) 标准偏好域
+    [a addObject:@"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist"];
+    [a addObject:@"/var/jb/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist"];
+    // 4) 微信输入法相关 App Group 共享容器
+    NSString *shared = @"/var/mobile/Containers/Shared/AppGroup";
+    for (NSString *sub in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:shared error:nil]) {
+        NSString *base = [shared stringByAppendingPathComponent:sub];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:
+            [base stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"]];
+        NSString *gid = m[@"MCMMetadataIdentifier"];
+        if (![gid isKindOfClass:[NSString class]]) continue;
+        if ([gid containsString:@"tencent"] || [gid containsString:@"wetype"] ||
+            [gid containsString:@"xin"] || [gid containsString:@"wechat"]) {
+            [a addObject:[base stringByAppendingPathComponent:@"WeTypeEnhance/config.plist"]];
+        }
+    }
+    return a;
+}
+
+static NSDictionary *gConfigDict     = nil;   // 当前生效的原始偏好快照
+static NSString     *gConfigDictPath = nil;   // 快照来源（诊断用）
+
+// 逐路径扫描，取「修改时间最新」的那份非空配置
+static NSDictionary *WTE_ReadRawPrefs(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *best = nil;
+    NSString *bestPath = nil;
+    NSDate *bestDate = nil;
+
+    for (NSString *path in WTE_PrefCandidates()) {
+        if (![path isKindOfClass:[NSString class]] || path.length == 0) continue;
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        if (!attr) continue;
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+        if (![d isKindOfClass:[NSDictionary class]] || d.count == 0) continue;
+        NSDate *mod = attr[NSFileModificationDate] ?: [NSDate dateWithTimeIntervalSince1970:0];
+        if (best && bestDate && [mod compare:bestDate] != NSOrderedDescending) continue;
+        best = d; bestPath = path; bestDate = mod;
+    }
+    if (best) { gConfigDictPath = bestPath; return best; }
+
+    // 最后兜底：cfprefsd。越狱环境下 cfprefsd 读偏好通常不受 app 沙盒限制，
+    // 所以即使上面的直读全部失败，这条路仍可能拿到配置。
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
+    NSDictionary *rep = [ud persistentDomainForName:kPrefDomain];
+    if ([rep isKindOfClass:[NSDictionary class]] && rep.count) {
+        gConfigDictPath = @"cfprefsd://com.colorblack.wetypeenhance";
+        return rep;
+    }
+    gConfigDictPath = nil;
+    return nil;
 }
 
 static NSString *WTE_PrefPath(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *p in WTE_PrefCandidates()) {
-        if ([fm fileExistsAtPath:p]) return p;
-    }
-    return [WTE_PrefCandidates() firstObject];
+    if (gConfigDictPath.length) return gConfigDictPath;
+    return @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist";
 }
 
 id WTE_GetPref(NSString *key) {
     if (!key) return nil;
-    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
-    id v = dict[key];
+    if (!gConfigDict) gConfigDict = WTE_ReadRawPrefs();
+    id v = gConfigDict[key];
     if (v) return v;
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
     return [ud objectForKey:key];
@@ -87,8 +151,9 @@ id WTE_GetPref(NSString *key) {
 
 void WTE_SetPref(NSString *key, id value) {
     if (!key) return;
-    // 所有候选路径都写一份，读哪份都能读到
+    // 所有可写候选路径都写一份，读哪份都能读到
     for (NSString *path in WTE_PrefCandidates()) {
+        if (![path isKindOfClass:[NSString class]] || path.length == 0) continue;
         NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
         if (!dict) dict = [NSMutableDictionary dictionary];
         if (value == nil) [dict removeObjectForKey:key];
@@ -99,6 +164,7 @@ void WTE_SetPref(NSString *key, id value) {
     if (value == nil) [ud removeObjectForKey:key];
     else [ud setObject:value forKey:key];
     [ud synchronize];
+    gConfigDict = nil;      // 使缓存失效，下次读取重新扫描
 }
 
 void WTE_NotifyChanged(void) {
@@ -255,7 +321,7 @@ static void WTE_DiagFlush(NSString *tag) {}
     //   键盘橙色背景 + 按键红色。
     // 键盘变红橙 → 注入/hook 全通，问题是「偏好读不到」（沙盒），换存储方案即可
     // 键盘没变化 → 注入或类扫描问题，需要 diag.txt
-    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
+    NSDictionary *raw = gConfigDict ?: WTE_ReadRawPrefs();
     BOOL prefsReadable = raw.count > 0;
     if (!prefsReadable) {
         c.enabled = YES;
@@ -334,6 +400,7 @@ static WTEConfig *gConfig = nil;
 static dispatch_queue_t gPrefQueue;
 
 static void WTE_ReloadConfig(void) {
+    gConfigDict = WTE_ReadRawPrefs();   // 刷新原始快照（缓存失效）
     gConfig = [WTEConfig loadConfig];
 }
 
@@ -501,23 +568,6 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
 }
 @end
 
-#pragma mark - ========== 背景图铺满 ==========
-
-@interface WTEBackgroundView : UIImageView
-@end
-@implementation WTEBackgroundView
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    if (!self.image || !self.superview) return;
-    CGSize bs = self.superview.bounds.size;
-    CGSize is = self.image.size;
-    if (bs.width <= 0 || bs.height <= 0 || is.width <= 0 || is.height <= 0) return;
-    CGFloat scale = MAX(bs.width / is.width, bs.height / is.height);
-    CGFloat w = is.width * scale, h = is.height * scale;
-    self.frame = CGRectMake((bs.width - w) / 2.0, (bs.height - h) / 2.0, w, h);
-}
-@end
-
 #pragma mark - ========== 视图树重排辅助 ==========
 
 @implementation UIView (WTEEnhance)
@@ -529,58 +579,46 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
 
 #pragma mark - ========== 核心：把配置应用到单个视图 ==========
 
-static const void *kWTEKBGKey   = &kWTEKBGKey;    // 键盘背景层
-static const void *kWTEStyledKey = &kWTEStyledKey; // 本轮是否已处理
-static Class gKBRootClass = Nil;                  // 记录最外层的键盘容器类
-
 static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
-    UIView *bg = objc_getAssociatedObject(self, kWTEKBGKey);
-    BOOL needBg = c.bgEnabled || c.keyboardTransparent ||
-                  [c.bgMode isEqualToString:@"transparent"] || [c.bgMode isEqualToString:@"image"];
-    if (!needBg) {
-        if (bg) {
-            [bg removeFromSuperview];
-            objc_setAssociatedObject(self, kWTEKBGKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
+    BOOL transparent = c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"];
+    BOOL imageBg     = c.bgEnabled && [c.bgMode isEqualToString:@"image"] && c.bgImage;
+    BOOL solidBg     = c.bgEnabled && !transparent && !imageBg;
+
+    // v1.7.0：不再往键盘视图里 insertSubview。
+    // 之前是在 -layoutSubviews 内部插一个背景子视图，等于在布局途中改视图树，
+    // UIKit 会异常/死循环 → 整个输入法崩溃。
+    // 现在全部走图层：背景色用 backgroundColor，背景图用 layer.contents，零视图树改动。
+    CALayer *layer = self.layer;
+
+    if (imageBg) {
+        layer.contents = (__bridge id)c.bgImage.CGImage;
+        layer.contentsGravity = kCAGravityResizeAspectFill;
+        layer.contentsScale = c.bgImage.scale > 0 ? c.bgImage.scale : [UIScreen mainScreen].scale;
+        layer.masksToBounds = YES;
+        ((UIView *)self).backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
     } else {
-        if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
+        if (layer.contents) layer.contents = nil;
+        if (solidBg) {
+            self.backgroundColor = [c.bgColor colorWithAlphaComponent:c.bgAlpha];
+        } else if (transparent) {
             self.backgroundColor = [UIColor clearColor];
             self.opaque = NO;
             if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
+                } @catch (__unused NSException *e) {}
             }
-        }
-        if (!bg) {
-            bg = [[UIView alloc] initWithFrame:self.bounds];
-            bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            bg.userInteractionEnabled = NO;
-            [self insertSubview:bg atIndex:0];
-            objc_setAssociatedObject(self, kWTEKBGKey, bg, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        bg.frame = self.bounds;
-        for (UIView *sub in [bg.subviews copy]) {
-            if ([sub isKindOfClass:[WTEBackgroundView class]]) [sub removeFromSuperview];
-        }
-        if ([c.bgMode isEqualToString:@"image"] && c.bgImage) {
-            bg.backgroundColor = [UIColor clearColor];
-            WTEBackgroundView *iv = [[WTEBackgroundView alloc] initWithImage:c.bgImage];
-            iv.contentMode = UIViewContentModeScaleAspectFill;
-            iv.clipsToBounds = YES;
-            iv.userInteractionEnabled = NO;
-            iv.frame = bg.bounds;
-            [bg addSubview:iv];
-        } else if ([c.bgMode isEqualToString:@"transparent"] || c.keyboardTransparent) {
-            bg.backgroundColor = [UIColor clearColor];
-        } else {
-            bg.backgroundColor = [c.bgColor colorWithAlphaComponent:c.bgAlpha];
         }
     }
 
-    // 键盘整体位移
-    if (c.kbOffset != 0.0) {
-        self.transform = CGAffineTransformMakeTranslation(0, c.kbOffset);
-    } else if (self.transform.ty != 0 || self.transform.tx != 0) {
-        self.transform = CGAffineTransformIdentity;
+    // 键盘整体位移：只在目标值变化时才写 transform，
+    // 否则每次布局都改 transform 会反复触发父视图重新布局（CPU 打满 + 抖动）
+    CGFloat want = (CGFloat)c.kbOffset;
+    CGFloat cur  = self.transform.ty;
+    if (fabs(cur - want) > 0.5) {
+        self.transform = want == 0.0 ? CGAffineTransformIdentity
+                                     : CGAffineTransformMakeTranslation(0, want);
     }
 }
 
@@ -687,132 +725,182 @@ static void WTE_ApplyToView(UIView *self) {
     }
 }
 
-#pragma mark - ========== 动态 hook ==========
+#pragma mark - ========== 动态 hook（白名单 + 崩溃防护） ==========
+//
+// 历史教训（v1.6.0 崩溃复盘）：
+//   1) 早期用 objc_getClassList 全量扫描 + 关键字匹配（Key / Keyboard / InputView），
+//      把 UIKeyboardLayoutStar、UIInputView 等【系统键盘类】也 hook 了 ——
+//      微信输入法宿主的是系统键盘视图树，改它们 = 直接崩，被 iOS 回退到苹果原生键盘。
+//   2) WTE_HookClassForLayout 没有「本类是否自己实现该方法」的守卫：
+//      class_getInstanceMethod 会沿继承链拿到父类的 IMP，若父类已被 hook，
+//      存下来的 prev 就是我们自己的 replacement → 调用时无限自递归。
+//   3) 在 -layoutSubviews 里 insertSubview 插背景视图 → 布局期改视图树 → UIKit 异常。
+// 对应修法：
+//   · 白名单固定类名，只碰微信输入法自己的 WB* 视图类，绝不碰系统类
+//   · 加「本类自己实现 layoutSubviews」守卫
+//   · orig 沿继承链查找（子类未被 hook 时也能正确回调父类原始实现）
+//   · 不再插任何子视图，背景改成直接设置 backgroundColor / layer.contents
+//   · 全局重入锁 gWTEBusy + @try/@catch 兜底
 
-static NSMutableDictionary *gOrigLayout;   // Class -> NSValue(IMP)
-static NSMutableDictionary *gOrigMove;     // Class -> NSValue(IMP)
-static NSMutableArray *gHookedClasses;
+static NSMutableDictionary *gOrigLayout;    // 类名 -> NSValue(原始 IMP)
+static NSMutableArray      *gHookedClasses;
+static BOOL gWTEBusy = NO;
 
-static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
-    // 防止同一对象在 orig 链中被重复处理
-    if (!objc_getAssociatedObject(self, kWTEStyledKey)) {
-        @try {
-            objc_setAssociatedObject(self, kWTEStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            WTE_ApplyToView(self);
-            objc_setAssociatedObject(self, kWTEStyledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } @catch (__unused NSException *e) {}
-    }
-
-    NSValue *v = gOrigLayout[NSStringFromClass([self class])];
-    if (v) ((void (*)(id, SEL))v.pointerValue)(self, _cmd);
+// —— 目标类白名单 ——
+// 全部来自键盘进程实际诊断报告（diag.txt 里扫出来的真实类名）
+static NSArray<NSString *> *WTE_TargetClassNames(void) {
+    return @[
+        // 键盘容器
+        @"WBKeyboardView", @"WBKeyboardRootView", @"WBRootInputView", @"WBMainInputView",
+        // 按键
+        @"WBKeyView", @"WBKeyViewButton", @"WBKeyButton",
+        @"WBNewlineKeyView", @"WBReturnKeyView", @"WBSecKeyboardKeyView",
+        @"WBRuleKeyView", @"WBSpaceKeyView",
+        // 候选栏 / 工具栏
+        @"WBCandidateView", @"WBCandidateBarView",
+        @"WBTopBar", @"WBArrangeView", @"WBCustomToolBarView",
+        @"WBToolBarButton", @"WBFunctionToolBar", @"WBPlusEntranceView",
+    ];
 }
 
-static void WTE_MoveReplacement(UIView *self, SEL _cmd) {
-    NSValue *v = gOrigMove[NSStringFromClass([self class])];
-    if (v) ((void (*)(id, SEL))v.pointerValue)(self, _cmd);
+// 类【自己】是否实现了该方法（不沿继承链找）—— 防自递归的关键守卫
+static BOOL WTE_ClassImplements(Class c, SEL sel) {
+    if (!c) return NO;
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(list[i]) == sel) { found = YES; break; }
+    }
+    if (list) free(list);
+    return found;
+}
 
+// 沿继承链找被 hook 时保存的原始 IMP
+// （子类没被 hook 时会走到父类的原始实现，避免「orig 为 nil → 布局被跳过」）
+static IMP WTE_OrigLayoutIMP(Class cls) {
+    Class k = cls;
+    while (k) {
+        NSString *n = NSStringFromClass(k);
+        if (n.length) {
+            NSValue *v = gOrigLayout[n];
+            if (v) return (IMP)v.pointerValue;
+        }
+        k = class_getSuperclass(k);
+    }
+    return NULL;
+}
+
+static void WTE_ApplySubtree(UIView *root, int depth);   // 前置声明
+
+static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
+    // 1) 先跑原始布局（保证 bounds 已是最终值）
+    IMP orig = WTE_OrigLayoutIMP([self class]);
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+
+    // 2) 再做美化。任何异常都不允许外泄，否则整个输入法崩掉
+    if (gWTEBusy) return;
+    WTEConfig *c = gConfig;
+    if (!c || !c.enabled) return;
+
+    gWTEBusy = YES;
     @try {
-        if (!objc_getAssociatedObject(self, kWTEStyledKey)) {
-            objc_setAssociatedObject(self, kWTEStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSString *cls = NSStringFromClass([self class]);
+        if (WTE_NameIsKeyboard(cls)) {
+            WTE_ApplyToView(self);        // 键盘背景（只设颜色 / layer，不插子视图）
+            WTE_ApplySubtree(self, 0);    // 子树的按键、候选栏、工具栏
+        } else {
             WTE_ApplyToView(self);
-            objc_setAssociatedObject(self, kWTEStyledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     } @catch (__unused NSException *e) {}
+    gWTEBusy = NO;
 
-    // 记录布局期见到的类（诊断用）
 #if WTE_LOG_ENABLE
-    NSString *cls = NSStringFromClass([self class]);
-    if (gLayoutSeen.count < 120 && ![gLayoutSeen containsObject:cls]) {
-        [gLayoutSeen addObject:cls];
-        NSString *txt = WTE_TextOfView(self);
-        WTE_Diag(@"layered: %@ text=%@ frame=%@", cls, txt ?: @"-", NSStringFromCGRect(self.frame));
+    NSString *cls2 = NSStringFromClass([self class]);
+    if (gLayoutSeen && gLayoutSeen.count < 80 && ![gLayoutSeen containsObject:cls2]) {
+        [gLayoutSeen addObject:cls2];
+        WTE_Diag(@"live: %@ text=%@ frame=%@", cls2,
+                 WTE_TextOfView(self) ?: @"-", NSStringFromCGRect(self.frame));
     }
 #endif
 }
 
-static void WTE_HookClassForLayout(Class c) {
+// 递归给子树里的键盘元素上色
+static void WTE_ApplySubtree(UIView *root, int depth) {
+    if (!root || depth > 8) return;
+    for (UIView *sub in [root.subviews copy]) {
+        @try {
+            NSString *cls = NSStringFromClass([sub class]);
+            if (WTE_NameIsKeyboard(cls) || WTE_NameIsKey(cls) ||
+                WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls)) {
+                WTE_ApplyToView(sub);
+            }
+        } @catch (__unused NSException *e) {}
+        WTE_ApplySubtree(sub, depth + 1);
+    }
+}
+
+static void WTE_HookClass(Class c) {
     if (!c) return;
     NSString *name = NSStringFromClass(c);
     if (!name.length) return;
-    if (gHookedClasses && [gHookedClasses containsObject:name]) return;
-
-    SEL layoutSel = @selector(layoutSubviews);
-    Method m = class_getInstanceMethod(c, layoutSel);
-    if (!m) return;
-
-    IMP prev = NULL;
-    MSHookMessageEx(c, layoutSel, (IMP)&WTE_LayoutReplacement, (IMP *)&prev);
-    if (prev) gOrigLayout[name] = [NSValue valueWithPointer:prev];
-
-    SEL moveSel = @selector(didMoveToWindow);
-    Method m2 = class_getInstanceMethod(c, moveSel);
-    if (m2) {
-        IMP prev2 = NULL;
-        MSHookMessageEx(c, moveSel, (IMP)&WTE_MoveReplacement, (IMP *)&prev2);
-        if (prev2) gOrigMove[name] = [NSValue valueWithPointer:prev2];
-    }
-
     if (!gHookedClasses) gHookedClasses = [NSMutableArray new];
+    if ([gHookedClasses containsObject:name]) return;
     [gHookedClasses addObject:name];
+
+    SEL sel = @selector(layoutSubviews);
+    if (!WTE_ClassImplements(c, sel)) {
+        // 自己不实现 → 它的实例会走到父类被 hook 的实现，不需要（也不能）重复 hook
+        return;
+    }
+    IMP prev = NULL;
+    MSHookMessageEx(c, sel, (IMP)&WTE_LayoutReplacement, &prev);
+    if (prev) gOrigLayout[name] = [NSValue valueWithPointer:prev];
 }
 
-// 类名是否符合 hook 目标特征
-static BOOL WTE_NameLooksInteresting(NSString *n) {
-    if (!n.length) return NO;
-    if ([n hasPrefix:@"UI"] && ![n containsString:@"Keyboard"]) return NO;   // 少动系统 UI 类
-    if ([n containsString:@"Keyboard"]) return YES;
-    if ([n containsString:@"Key"]) return YES;
-    if ([n containsString:@"Candidate"]) return YES;
-    if ([n containsString:@"ToolBar"]) return YES;
-    if ([n containsString:@"TopBar"]) return YES;
-    if ([n containsString:@"Arrange"]) return YES;
-    if ([n containsString:@"InputView"]) return YES;
-    if ([n containsString:@"RootInput"]) return YES;
-    if ([n containsString:@"MainInput"]) return YES;
-    if ([n hasPrefix:@"WB"]) return YES;
-    if ([n hasPrefix:@"Tx"]) return YES;
-    return NO;
-}
+// 白名单安装；若白名单一个都没命中（输入法版本变化），
+// 才退回「窄范围扫描」—— 只认 WB 前缀且名字含键盘语义的 UIView 类。
+static int WTE_InstallHooks(void) {
+    int hooked = 0;
+    for (NSString *n in WTE_TargetClassNames()) {
+        Class c = NSClassFromString(n);
+        if (!c) { WTE_Diag(@"  [miss] %@ 不存在", n); continue; }
+        if (![c isSubclassOfClass:[UIView class]]) { WTE_Diag(@"  [skip] %@ 非 UIView", n); continue; }
+        WTE_HookClass(c);
+        hooked++;
+        WTE_Diag(@"  [ok]   %@  ownLayoutSubviews=%d", n,
+                 WTE_ClassImplements(c, @selector(layoutSubviews)));
+    }
 
-static int WTE_ScanAndHookClasses(void) {
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return 0;
-    Class *classes = (Class *)malloc(sizeof(Class) * count);
-    if (!classes) return 0;
-    count = objc_getClassList(classes, count);
-
-    NSMutableArray *candidates = [NSMutableArray array];
-    NSMutableArray *allNames = [NSMutableArray array];
-
-    for (int i = 0; i < count; i++) {
-        Class c = classes[i];
-        NSString *n = NSStringFromClass(c);
-        if (!n.length) continue;
-
-        // 只关心 UIView 体系
-        BOOL isView = NO;
-        Class s = c;
-        while (s) {
-            if (s == [UIView class]) { isView = YES; break; }
-            s = class_getSuperclass(s);
-        }
-        if (!isView) continue;
-
-        if (WTE_NameLooksInteresting(n)) {
-            [candidates addObject:n];
-            [allNames addObject:n];
+    if (hooked == 0) {
+        WTE_Diag(@"!!! 白名单全部未命中，退回窄范围扫描（只认 WB 前缀 + 键盘语义）");
+        int count = objc_getClassList(NULL, 0);
+        if (count > 0) {
+            Class *classes = (Class *)malloc(sizeof(Class) * count);
+            if (classes) {
+                count = objc_getClassList(classes, count);
+                for (int i = 0; i < count; i++) {
+                    Class c = classes[i];
+                    NSString *n = NSStringFromClass(c);
+                    if (!n.length || ![n hasPrefix:@"WB"]) continue;
+                    if ([n hasPrefix:@"WBBookVideo"]) continue;   // 书城/视频无关业务
+                    BOOL isView = NO;
+                    Class s = c;
+                    while (s) { if (s == [UIView class]) { isView = YES; break; } s = class_getSuperclass(s); }
+                    if (!isView) continue;
+                    // 仍然只认键盘语义，避免误碰业务类
+                    if (!([n containsString:@"Key"] || [n containsString:@"Keyboard"] ||
+                          [n containsString:@"Candidate"] || [n containsString:@"ToolBar"] ||
+                          [n containsString:@"TopBar"] || [n containsString:@"InputView"])) continue;
+                    WTE_HookClass(c);
+                    hooked++;
+                    WTE_Diag(@"  [fallback] %@", n);
+                }
+                free(classes);
+            }
         }
     }
-    free(classes);
-
-    [allNames sortUsingSelector:@selector(compare:)];
-    WTE_Diag(@"=== 候选类扫描：共 %d 个 UIView 类命中特征 ===", (int)allNames.count);
-    for (NSString *n in allNames) WTE_Diag(@"  class %@", n);
-
-    for (NSString *n in candidates) {
-        WTE_HookClassForLayout(NSClassFromString(n));
-    }
-    return (int)candidates.count;
+    return hooked;
 }
 
 #pragma mark - ========== 初始化 ==========
@@ -923,27 +1011,28 @@ static void WTE_Init(void) {
     gLayoutSeen = [NSMutableSet new];
 #endif
     gOrigLayout = [NSMutableDictionary new];
-    gOrigMove = [NSMutableDictionary new];
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.6.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.7.0 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
-    WTE_Diag(@"--- 偏好可读性检查 ---");
+    WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
-        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:p];
+        if (![p isKindOfClass:[NSString class]]) continue;
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-        WTE_Diag(@"  %@ exists=%d keys=%d", p, exists, (int)d.count);
+        WTE_Diag(@"  [%@] %@ keys=%d mtime=%@",
+                 attr ? @"可读" : @"不可读", p, (int)d.count,
+                 attr[NSFileModificationDate] ?: @"-");
     }
+    WTE_Diag(@"--- 最终采用的来源 ---");
+    WTE_Diag(@"  source = %@", gConfigDictPath ?: @"(无，说明所有通道都读不到)");
     WTE_Diag(@"--- 当前配置 ---");
     WTE_Diag(@"  enabled=%d bgEnabled=%d bgMode=%@ keyColorEnabled=%d skinEnabled=%d kbOffset=%.1f",
              gConfig.enabled, gConfig.bgEnabled, gConfig.bgMode,
              gConfig.keyColorEnabled, gConfig.skinEnabled, gConfig.kbOffset);
-    WTE_Diag(@"  raw prefs = %@", [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()]);
-    WTE_Diag(@"--- App Group 容器 ---");
-    for (NSString *d in WTE_DiagDirs()) WTE_Diag(@"  dir %@", d);
 
-    // 立刻写一次：证明本进程确实注入了（不依赖类扫描成功）
+    // 立刻写一次：证明本进程确实注入了（不依赖 hook 成功）
     WTE_DiagFlush(@"init");
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -953,10 +1042,10 @@ static void WTE_Init(void) {
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // 类扫描 + 动态 hook（延迟到主线程，等 dyld 把输入法类都注册好）
+    // 白名单 hook（延迟到主线程，等 dyld 把输入法类都注册好）
     dispatch_async(dispatch_get_main_queue(), ^{
-        int hooked = WTE_ScanAndHookClasses();
-        WTE_Diag(@"=== 已 hook %d 个类 ===", hooked);
-        WTE_DiagFlush(@"scan");
+        int hooked = WTE_InstallHooks();
+        WTE_Diag(@"=== 白名单命中并 hook %d 个类 ===", hooked);
+        WTE_DiagFlush(@"hooks");
     });
 }

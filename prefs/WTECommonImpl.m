@@ -95,3 +95,70 @@ void WTE_NotifyChanged(void) {
                                          (__bridge CFStringRef)kPrefChangedNotify,
                                          NULL, NULL, YES);
 }
+
+#pragma mark - 配置同步（键盘扩展沙盒保底通道）
+
+// 扫描某类容器目录，挑出标识里含微信输入法关键字的那几个
+static NSArray *WTEP_ContainersMatching(NSString *basePath, NSArray *keywords) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *sub in [fm contentsOfDirectoryAtPath:basePath error:nil]) {
+        NSString *base = [basePath stringByAppendingPathComponent:sub];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:
+            [base stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"]];
+        NSString *ident = m[@"MCMMetadataIdentifier"];
+        NSString *t = [[NSString stringWithFormat:@"%@ %@", ident ?: @"", sub] lowercaseString];
+        for (NSString *kw in keywords) {
+            if ([t containsString:kw]) { [out addObject:base]; break; }
+        }
+    }
+    return out;
+}
+
+NSArray *WTE_SyncConfigToReadablePlaces(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 源数据：标准偏好域（面板刚写进去的那份）
+    NSDictionary *src = [NSDictionary dictionaryWithContentsOfFile:
+        @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist"];
+    if (![src isKindOfClass:[NSDictionary class]] || src.count == 0) {
+        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
+        src = [ud persistentDomainForName:kPrefDomain];
+    }
+    if (![src isKindOfClass:[NSDictionary class]] || src.count == 0) return @[];
+
+    NSMutableArray *targets = [NSMutableArray array];
+    [targets addObject:@"/var/mobile/Library/Application Support/WeTypeEnhance/config.plist"];
+    [targets addObject:@"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/config.plist"];
+    [targets addObject:@"/var/mobile/Media/WeTypeEnhance/config.plist"];
+
+    NSArray *kws = @[@"wetype", @"tencent", @"wxkb", @"xin.keyboard", @"wechat"];
+
+    // ① 键盘扩展容器 —— 这是最关键的通道：键盘进程读自己的容器永远不受沙盒限制
+    for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Data/PluginKitPlugin", kws)) {
+        [targets addObject:[base stringByAppendingPathComponent:@"Documents/WeTypeEnhance/config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"Documents/wte_config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"Library/Application Support/WeTypeEnhance/config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"tmp/WeTypeEnhance/config.plist"]];
+    }
+    // ② 主 App 容器
+    for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Data/Application", kws)) {
+        [targets addObject:[base stringByAppendingPathComponent:@"Documents/WeTypeEnhance/config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"Library/Application Support/WeTypeEnhance/config.plist"]];
+    }
+    // ③ App Group 共享容器
+    for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Shared/AppGroup", kws)) {
+        [targets addObject:[base stringByAppendingPathComponent:@"WeTypeEnhance/config.plist"]];
+    }
+
+    NSMutableArray *ok = [NSMutableArray array];
+    for (NSString *dest in targets) {
+        NSString *dir = [dest stringByDeletingLastPathComponent];
+        if (![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        if (![fm fileExistsAtPath:dir]) continue;
+        if ([src writeToFile:dest atomically:YES]) [ok addObject:dest];
+    }
+    return ok;
+}

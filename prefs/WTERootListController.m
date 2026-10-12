@@ -361,6 +361,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     // ---- 8. 诊断 ----
     [specs addObject:[self group:@"诊断"]];
     [specs addObject:[self buttonRow:@"生成诊断报告" action:@selector(openDiagReport:)]];
+    [specs addObject:[self buttonRow:@"同步配置到键盘" action:@selector(syncToKeyboard:)]];
     [specs addObject:[self group:@""]];
     [specs addObject:[self buttonRow:@"恢复默认设置"   action:@selector(resetAll:)]];
 
@@ -379,6 +380,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 - (void)setPref:(id)value forSpecifier:(PSSpecifier *)spec {
     NSString *key = [spec propertyForKey:@"key"];
     WTE_SetPref(key, value);
+    WTE_SyncConfigToReadablePlaces();   // 同步到键盘扩展容器（沙盒保底通道）
     WTE_NotifyChanged();
     [self reloadSpecifiers];
 }
@@ -435,6 +437,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 }
 - (void)setColorValue:(NSString *)hex forSpecifier:(PSSpecifier *)spec {
     WTE_SetPref([spec propertyForKey:@"key"], hex);
+    WTE_SyncConfigToReadablePlaces();
     WTE_NotifyChanged();
 }
 
@@ -450,6 +453,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 }
 - (void)setChoiceValue:(id)value forSpecifier:(PSSpecifier *)spec {
     WTE_SetPref([spec propertyForKey:@"key"], value);
+    WTE_SyncConfigToReadablePlaces();
     WTE_NotifyChanged();
 }
 
@@ -462,6 +466,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     if (idx == NSNotFound) idx = 0;
     NSString *next = values[(idx + 1) % values.count];
     WTE_SetPref([spec propertyForKey:@"key"], next);
+    WTE_SyncConfigToReadablePlaces();
     WTE_NotifyChanged();
     [self reloadSpecifiers];
 }
@@ -472,6 +477,36 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 }
 - (void)setDisplay:(id)value forSpecifier:(PSSpecifier *)spec {
     // no-op
+}
+
+// 手动把配置刷一遍到所有可读位置（键盘扩展容器 / Media / App Group）
+// 用于「改了设置但键盘没反应」时手工重推一次，并直接看到写成功了几处。
+- (void)syncToKeyboard:(PSSpecifier *)spec {
+    NSArray *ok = WTE_SyncConfigToReadablePlaces();
+    NSMutableString *detail = [NSMutableString string];
+    NSUInteger shown = 0;
+    for (NSString *p in ok) {
+        if (shown >= 12) { [detail appendString:@"  …\n"]; break; }
+        [detail appendFormat:@"%@\n", p];
+        shown++;
+    }
+    NSString *msg;
+    if (ok.count == 0) {
+        msg = @"没有写入任何位置。\n\n"
+               "说明 Preferences 进程也无法访问键盘扩展容器 / Media。\n"
+               "此时只能依赖 cfprefsd 通道 —— 请点「生成诊断报告」，"
+               "报告里的「最终采用的来源」如果是 cfprefsd:// 就说明偏好其实是读得到的。";
+    } else {
+        msg = [NSString stringWithFormat:
+               @"已写入 %lu 处：\n\n%@\n"
+                "键盘会在下次弹出时读取（或注销一次让插件重新加载）。",
+               (unsigned long)ok.count, detail];
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"同步配置"
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 // 面板入口：查看诊断报告
@@ -641,6 +676,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     WTE_SetPref(kKeyEnabled, @YES);
     WTE_SetPref(kKeyBgEnabled, @YES);
     WTE_SetPref(kKeyKeyColorEnabled, @YES);
+    WTE_SyncConfigToReadablePlaces();
     WTE_NotifyChanged();
     [self reloadSpecifiers];
 }

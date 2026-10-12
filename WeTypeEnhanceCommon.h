@@ -73,6 +73,12 @@ id        WTE_GetPref(NSString *key);
 void      WTE_SetPref(NSString *key, id value);
 void      WTE_NotifyChanged(void);
 
+// 把当前偏好复制到所有「键盘扩展读得到」的位置（键盘扩展容器 / Media /
+// Application Support / App Group）。返回成功写入的完整路径数组。
+// 面板跑在 Preferences 进程里，不受 app 沙盒限制，所以这一步能在键盘
+// 直读 /var/mobile/Library/Preferences 被拦时提供保底通道。
+NSArray  *WTE_SyncConfigToReadablePlaces(void);
+
 #ifdef __cplusplus
 }
 #endif
