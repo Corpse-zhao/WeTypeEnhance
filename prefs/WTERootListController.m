@@ -62,7 +62,7 @@
 
 - (NSArray *)specifiers {
     if (!_specifiers) {
-        _specifiers = [self buildSpecifiers];
+        _specifiers = [[self buildSpecifiers] copy];
     }
     return _specifiers;
 }
@@ -105,11 +105,12 @@
                                                        set:nil
                                                        get:nil
                                                     detail:nil
-                                                      cell:NSClassFromString(@"WTEColorCell")
+                                                      cell:(PSCellType)NSClassFromString(@"WTEColorCell")
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
     [s setProperty:def forKey:@"defaultHex"];
     [s setProperty:def forKey:@"hexValue"];
+    [s setProperty:@YES forKey:@"isColorRow"];
     return s;
 }
 
@@ -235,13 +236,14 @@
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     PSSpecifier *spec = [self specifierAtIndexPath:indexPath];
-    if ([spec.cellClass isEqual:NSClassFromString(@"WTEColorCell")]) {
+    if ([[spec propertyForKey:@"isColorRow"] boolValue]) {
         self.pendingSpec = spec;
         UIColorPickerViewController *picker = [[UIColorPickerViewController alloc] init];
         picker.delegate = self;
         picker.supportsAlpha = YES;
         NSString *cur = [spec propertyForKey:@"hexValue"]
-                        ?: WTE_StringPref([spec propertyForKey:@"key"], [spec propertyForKey:@"defaultHex"]);
+                        ?: [self prefStringForKey:[spec propertyForKey:@"key"]
+                                     fallback:[spec propertyForKey:@"defaultHex"]];
         UIColor *c = WTE_ColorFromHex(cur);
         if (c) picker.selectedColor = c;
         [self presentViewController:picker animated:YES completion:nil];
@@ -249,6 +251,11 @@
         return;
     }
     [super tableView:tableView didSelectRowAtIndexPath:indexPath];
+}
+
+- (NSString *)prefStringForKey:(NSString *)key fallback:(NSString *)fallback {
+    id v = WTE_GetPref(key);
+    return [v isKindOfClass:[NSString class]] ? v : fallback;
 }
 
 - (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {
