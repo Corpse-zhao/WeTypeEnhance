@@ -113,6 +113,19 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 @implementation WTERootListController
 
 - (NSArray *)specifiers {
+    // 真正的 PSListController 内部大量路径直接读私有 ivar `_specifiers`，
+    // 不经过 getter。这里通过 runtime 把构建好的列表写入该 ivar，
+    // 保证内部数据源与我们的 getter 看到同一份数据。
+    Ivar ivar = class_getInstanceVariable([PSListController class], "_specifiers");
+    if (ivar) {
+        id cur = object_getIvar(self, ivar);
+        if (!cur) {
+            cur = [[self buildSpecifiers] copy];
+            object_setIvar(self, ivar, cur);
+        }
+        return cur;
+    }
+    // 兜底：ivar 不存在（理论上不会），退回自有存储
     if (!self.wteSpecifiers) {
         self.wteSpecifiers = [[self buildSpecifiers] copy];
     }
@@ -287,6 +300,8 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 // 重建 specifier 缓存后再交给父类刷新
 - (void)reloadSpecifiers {
     self.wteSpecifiers = nil;
+    Ivar ivar = class_getInstanceVariable([PSListController class], "_specifiers");
+    if (ivar) object_setIvar(self, ivar, nil);
     [super reloadSpecifiers];
 }
 
