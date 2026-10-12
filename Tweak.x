@@ -128,6 +128,10 @@ static dispatch_queue_t gDiagQueue;
 static BOOL gDiagFlushedClassScan = NO;
 static NSMutableSet *gLayoutSeen;
 
+#if WTE_LOG_ENABLE
+static void WTE_Diag(NSString *fmt, ...);   // 前置声明（定义在下面）
+#endif
+
 static NSArray *WTE_DiagDirs(void) {
     NSMutableArray *dirs = [NSMutableArray array];
     // 1) 全局可写位置
