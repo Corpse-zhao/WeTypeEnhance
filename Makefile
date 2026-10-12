@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = WeTypeEnhance
 
 WeTypeEnhance_FILES = Tweak.x
-WeTypeEnhance_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
+WeTypeEnhance_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-arc-performSelector-leaks -Wno-mismatched-return-types
 WeTypeEnhance_FRAMEWORKS = UIKit CoreGraphics QuartzCore
 WeTypeEnhance_PRIVATE_FRAMEWORKS =
 

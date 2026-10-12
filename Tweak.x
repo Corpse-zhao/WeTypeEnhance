@@ -159,7 +159,7 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
 
 @implementation WTEConfig
 
-+ (instancetype)load {
++ (instancetype)loadConfig {
     WTEConfig *c = [WTEConfig new];
 
     c.enabled = WTE_BoolPref(kKeyEnabled, YES);
@@ -227,7 +227,7 @@ static WTEConfig *gConfig = nil;
 static dispatch_queue_t gPrefQueue;
 
 static void WTE_ReloadConfig(void) {
-    gConfig = [WTEConfig load];
+    gConfig = [WTEConfig loadConfig];
 }
 
 static void WTE_PrefsChangedCallback(CFNotificationCenterRef center, void *observer,
@@ -268,13 +268,13 @@ static WTEKeyKind WTE_KeyKindForView(UIView *v) {
     // 拿按键文字判断
     NSString *text = nil;
     if ([v respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-        UILabel *lbl = [v performSelector:NSSelectorFromString(@"titleLabel")];
+        UILabel *lbl = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"titleLabel"));
         if ([lbl isKindOfClass:[UILabel class]]) text = lbl.text;
     }
     if (!text) {
         SEL s = NSSelectorFromString(@"text");
         if ([v respondsToSelector:s]) {
-            id t = [v performSelector:s];
+            id t = ((id (*)(id, SEL))objc_msgSend)(v, s);
             if ([t isKindOfClass:[NSString class]]) text = t;
         }
     }
@@ -397,7 +397,7 @@ static void WTE_WBKeyboardView_layoutSubviews(UIView *self, SEL _cmd) {
         self.backgroundColor = [UIColor clearColor];
         self.opaque = NO;
         if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
-            [self performSelector:NSSelectorFromString(@"setBackgroundEffects:") withObject:nil];
+            ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
         }
     }
 
@@ -488,7 +488,7 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
     if (c.keyColorEnabled && c.keyTextColor) {
         UILabel *lbl = nil;
         if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            lbl = [self performSelector:NSSelectorFromString(@"titleLabel")];
+            lbl = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
         }
         if ([lbl isKindOfClass:[UILabel class]]) lbl.textColor = c.keyTextColor;
         // 有些版本的 WBKeyView 直接是 UILabel 子类 / 内嵌
@@ -499,7 +499,7 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
     if (c.letterGradientEnabled || [c.letterColorMap count] > 0) {
         UILabel *lbl = nil;
         if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            lbl = [self performSelector:NSSelectorFromString(@"titleLabel")];
+            lbl = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
         }
         NSString *txt = ([lbl isKindOfClass:[UILabel class]]) ? lbl.text : nil;
         if (txt.length >= 1) {
@@ -515,7 +515,7 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
     if (c.keyColorEnabled && c.keyHighlightColor) {
         SEL s = NSSelectorFromString(@"setHighlightedBackgroundColor:");
         if ([self respondsToSelector:s]) {
-            [self performSelector:s withObject:c.keyHighlightColor];
+            ((void (*)(id, SEL, id))objc_msgSend)(self, s, c.keyHighlightColor);
         }
     }
 }
@@ -535,7 +535,7 @@ static void WTE_WBCandidateView_layoutSubviews(UIView *self, SEL _cmd) {
     if (c.keyColorEnabled && c.keyTextColor) {
         if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = c.keyTextColor;
         else if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            UILabel *l = [self performSelector:NSSelectorFromString(@"titleLabel")];
+            UILabel *l = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
             if ([l isKindOfClass:[UILabel class]]) l.textColor = c.keyTextColor;
         }
     }
