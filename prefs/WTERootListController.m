@@ -57,6 +57,70 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (void)reloadSpecifier:(PSSpecifier *)spec;
 @end
 
+@interface WTEDiagViewController : UIViewController
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, copy) NSString *reportText;
+@property (nonatomic, copy) NSString *reportPath;
+@end
+
+@implementation WTEDiagViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"诊断报告";
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                                                style:UIBarButtonItemStylePlain
+                                                               target:self
+                                                               action:@selector(copyReport:)];
+    UIBarButtonItem *closeItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                                 style:UIBarButtonItemStyleDone
+                                                                target:self
+                                                                action:@selector(close:)];
+    self.navigationItem.rightBarButtonItem = copyItem;
+    self.navigationItem.leftBarButtonItem = closeItem;
+
+    _textView = [[UITextView alloc] initWithFrame:self.view.bounds];
+    _textView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _textView.editable = NO;
+    _textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _textView.text = self.reportText ?: @"";
+    [self.view addSubview:_textView];
+}
+
+- (void)copyReport:(id)sender {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    if (@available(iOS 10.0, *)) {
+        pb.string = self.reportText ?: @"";
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已复制"
+                                                              message:@"诊断内容已复制到剪贴板，可直接粘贴发送"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)close:(id)sender {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+// 在候选路径里找诊断文件
+static NSString *WTEP_FindDiagPath(void) {
+    NSArray *paths = @[
+        @"/var/mobile/Media/WeTypeEnhance/diag.txt",
+        @"/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
+        @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in paths) {
+        if ([fm fileExistsAtPath:p]) return p;
+    }
+    return nil;
+}
+
 #pragma mark - 主控制器
 
 @interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate, PHPickerViewControllerDelegate>
@@ -350,90 +414,6 @@ typedef NS_ENUM(NSInteger, PSCellType) {
     // no-op
 }
 
-- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {
-    if (!self.pendingSpec) return;
-    NSString *hex = WTE_HexFromColor(vc.selectedColor);
-    [self.pendingSpec setProperty:hex forKey:@"hexValue"];
-    WTE_SetPref([self.pendingSpec propertyForKey:@"key"], hex);
-    WTE_NotifyChanged();
-    [self reloadSpecifiers];
-}
-
-- (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc {
-    if (!self.pendingSpec) return;
-    NSString *hex = WTE_HexFromColor(vc.selectedColor);
-    WTE_SetPref([self.pendingSpec propertyForKey:@"key"], hex);
-    WTE_NotifyChanged();
-    self.pendingSpec = nil;
-    [self reloadSpecifiers];
-}
-
-#pragma mark - 诊断报告查看器
-
-@interface WTEDiagViewController : UIViewController
-@property (nonatomic, strong) UITextView *textView;
-@property (nonatomic, copy) NSString *reportText;
-@property (nonatomic, copy) NSString *reportPath;
-@end
-
-@implementation WTEDiagViewController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"诊断报告";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-
-    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制"
-                                                                style:UIBarButtonItemStylePlain
-                                                               target:self
-                                                               action:@selector(copyReport:)];
-    UIBarButtonItem *closeItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
-                                                                 style:UIBarButtonItemStyleDone
-                                                                target:self
-                                                                action:@selector(close:)];
-    self.navigationItem.rightBarButtonItem = copyItem;
-    self.navigationItem.leftBarButtonItem = closeItem;
-
-    _textView = [[UITextView alloc] initWithFrame:self.view.bounds];
-    _textView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _textView.editable = NO;
-    _textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    _textView.text = self.reportText ?: @"";
-    [self.view addSubview:_textView];
-}
-
-- (void)copyReport:(id)sender {
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    if (@available(iOS 10.0, *)) {
-        pb.string = self.reportText ?: @"";
-    }
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已复制"
-                                                              message:@"诊断内容已复制到剪贴板，可直接粘贴发送"
-                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
-}
-
-- (void)close:(id)sender {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-@end
-
-// 在候选路径里找诊断文件
-static NSString *WTEP_FindDiagPath(void) {
-    NSArray *paths = @[
-        @"/var/mobile/Media/WeTypeEnhance/diag.txt",
-        @"/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
-        @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/diag.txt",
-    ];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *p in paths) {
-        if ([fm fileExistsAtPath:p]) return p;
-    }
-    return nil;
-}
-
 // 面板入口：查看诊断报告
 - (void)openDiagReport:(PSSpecifier *)spec {
     NSString *path = WTEP_FindDiagPath();
@@ -455,6 +435,25 @@ static NSString *WTEP_FindDiagPath(void) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+
+- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {
+    if (!self.pendingSpec) return;
+    NSString *hex = WTE_HexFromColor(vc.selectedColor);
+    [self.pendingSpec setProperty:hex forKey:@"hexValue"];
+    WTE_SetPref([self.pendingSpec propertyForKey:@"key"], hex);
+    WTE_NotifyChanged();
+    [self reloadSpecifiers];
+}
+
+- (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc {
+    if (!self.pendingSpec) return;
+    NSString *hex = WTE_HexFromColor(vc.selectedColor);
+    WTE_SetPref([self.pendingSpec propertyForKey:@"key"], hex);
+    WTE_NotifyChanged();
+    self.pendingSpec = nil;
+    [self reloadSpecifiers];
 }
 
 #pragma mark - 相册选图
