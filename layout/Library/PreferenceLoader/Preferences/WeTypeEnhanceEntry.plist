@@ -1,0 +1,10 @@
+{
+    entry = {
+        cell = PSLinkCell;
+        bundle = WeTypeEnhancePrefs;
+        detail = WTERootListController;
+        icon = icon.png;
+        label = "微信输入法增强";
+        isController = 1;
+    };
+}

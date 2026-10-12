@@ -1,0 +1,62 @@
+name: Build WeTypeEnhance (roothide)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid xz make
+          echo "THEOS=/opt/theos" >> $GITHUB_ENV
+
+      - name: Setup roothide Theos
+        run: |
+          export THEOS=/opt/theos
+          sudo mkdir -p $THEOS
+          sudo chown -R $(id -u):$(id -g) $THEOS
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git $THEOS
+          $THEOS/bin/theos-sdk-installer 2>/dev/null || true
+          ls $THEOS
+
+      - name: Install iOS SDK
+        run: |
+          export THEOS=/opt/theos
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p $THEOS/sdks
+          cp -R /tmp/sdks/iPhoneOS16.5.sdk $THEOS/sdks/ 2>/dev/null || \
+          cp -R /tmp/sdks/$(ls /tmp/sdks | grep '^iPhoneOS' | sort -V | tail -1) $THEOS/sdks/
+          ls $THEOS/sdks
+
+      - name: Build package (roothide)
+        env:
+          THEOS: /opt/theos
+        run: |
+          set -o pipefail
+          export PATH=$THEOS/bin:$PATH
+          gmake clean 2>/dev/null || true
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+
+      - name: Verify package
+        run: |
+          ls -la packages/ || true
+          PKG=$(ls packages/*.deb | head -1)
+          echo "PACKAGE=$PKG"
+          echo "=== size ==="
+          ls -la "$PKG"
+          echo "=== control ==="
+          ar p "$PKG" control.tar.* 2>/dev/null | tar -xO ./control 2>/dev/null || true
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeTypeEnhance-deb
+          path: packages/*.deb
+          if-no-files-found: error

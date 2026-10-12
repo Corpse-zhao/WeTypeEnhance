@@ -1,0 +1,13 @@
+{
+    Filter = {
+        Bundles = (
+            "com.tencent.wetype.keyboard",
+            "com.tencent.xin.keyboard",
+            "com.tencent.wetype"
+        );
+        Executables = (
+            "wxkb_plugin",
+            "wxkb_plugin.appex"
+        );
+    };
+}
