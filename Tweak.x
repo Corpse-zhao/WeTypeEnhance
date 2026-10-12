@@ -3,17 +3,29 @@
 //
 // 目标 Bundle:  com.tencent.wetype.keyboard / com.tencent.xin.keyboard / com.tencent.wetype
 // 目标进程:     wxkb_plugin / wxkb_plugin.appex
-// 可 hook 类:   WBKeyboardView WBKeyView WBReturnKeyView WBSecKeyboardKeyView
-//               WBRuleKeyView WBCandidateView WBArrangeView WBTopBar
-//               WBToolBarButton WBButton WBRootInputView WBMainInputView WBT26Panel
+//
+// 设计要点（v1.1.0 起）：
+//   输入法版本迭代后类名可能变化，因此不再写死 WB* 类，改为：
+//     1) 运行时枚举所有类，按名字特征挑出「键盘/按键/候选/工具栏」候选类
+//     2) 对这些类动态 hook -layoutSubviews / -didMoveToWindow
+//     3) 处理时按类名特征 + 视图内容做通用判定，不依赖固定类名
+//   同时输出诊断文件，便于类名变化时快速定位。
 //
 // 包名: com.colorblack.wetypeenhance
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <substrate.h>
 #import "WeTypeEnhanceCommon.h"
+
+#define WTE_LOG_ENABLE 1
+
+// 前置声明：视图树重排分类（定义在后面）
+@interface UIView (WTEEnhance)
+- (void)_wte_relayoutTree;
+@end
 
 #pragma mark - ========== 工具函数 ==========
 
@@ -42,36 +54,33 @@ NSString *WTE_HexFromColor(UIColor *color) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
     if (![color getRed:&r green:&g blue:&b alpha:&a]) {
         CGFloat w = 0, wa = 0;
-        if ([color getWhite:&w alpha:&wa]) {
-            r = g = b = w; a = wa;
-        } else {
-            return @"#000000";
-        }
+        if ([color getWhite:&w alpha:&wa]) { r = g = b = w; a = wa; }
+        else { return @"#000000"; }
     }
     return [NSString stringWithFormat:@"#%02X%02X%02X%02X",
             (int)round(r * 255), (int)round(g * 255), (int)round(b * 255), (int)round(a * 255)];
 }
 
-// 兼容 rootless / roothide / 纯越狱 三种路径
-static NSString *WTE_PrefPath(void) {
-    NSArray *candidates = @[
+static NSArray *WTE_PrefCandidates(void) {
+    return @[
         @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
         @"/var/jb/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist",
     ];
+}
+
+static NSString *WTE_PrefPath(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *p in candidates) {
+    for (NSString *p in WTE_PrefCandidates()) {
         if ([fm fileExistsAtPath:p]) return p;
     }
-    return candidates.firstObject;
+    return [WTE_PrefCandidates() firstObject];
 }
 
 id WTE_GetPref(NSString *key) {
     if (!key) return nil;
-    NSString *path = WTE_PrefPath();
-    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
     id v = dict[key];
     if (v) return v;
-    // 回退到 NSUserDefaults（部分越狱环境 plist 缓存行为不同）
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
     return [ud objectForKey:key];
 }
@@ -81,13 +90,9 @@ void WTE_SetPref(NSString *key, id value) {
     NSString *path = WTE_PrefPath();
     NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
     if (!dict) dict = [NSMutableDictionary dictionary];
-    if (value == nil) {
-        [dict removeObjectForKey:key];
-    } else {
-        dict[key] = value;
-    }
+    if (value == nil) [dict removeObjectForKey:key];
+    else dict[key] = value;
     [dict writeToFile:path atomically:YES];
-    // 同步一份到 NSUserDefaults，保证面板与 tweak 读到一致
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefDomain];
     if (value == nil) [ud removeObjectForKey:key];
     else [ud setObject:value forKey:key];
@@ -113,9 +118,50 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
     return [v isKindOfClass:[NSString class]] ? v : def;
 }
 
+#pragma mark - ========== 诊断输出 ==========
+
+#if WTE_LOG_ENABLE
+static NSMutableString *gDiag;
+static dispatch_queue_t gDiagQueue;
+static BOOL gDiagFlushedClassScan = NO;
+static NSMutableSet *gLayoutSeen;
+
+static void WTE_DiagFlush(NSString *tag) {
+    if (!gDiag) return;
+    NSString *content = [gDiag copy];
+    NSArray *dirs = @[
+        @"/var/mobile/Library/Application Support/WeTypeEnhance",
+        @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance",
+        @"/var/mobile/Media/WeTypeEnhance",
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *dir in dirs) {
+        NSError *e = nil;
+        if (![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&e];
+        }
+        if (![fm fileExistsAtPath:dir]) continue;
+        NSString *dest = [dir stringByAppendingPathComponent:@"diag.txt"];
+        [content writeToFile:dest atomically:YES encoding:NSUTF8StringEncoding error:&e];
+    }
+}
+
+static void WTE_Diag(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    if (!gDiag) gDiag = [NSMutableString new];
+    [gDiag appendFormat:@"%@\n", line];
+    NSLog(@"[WeTypeEnhance] %@", line);
+}
+#else
+#define WTE_Diag(...) do {} while (0)
+static void WTE_DiagFlush(NSString *tag) {}
+#endif
+
 #pragma mark - ========== 全局配置快照 ==========
 
-// 每次读到偏好变更就重建，避免在 layout 热路径里反复读磁盘
 @interface WTEConfig : NSObject
 @property (nonatomic, assign) BOOL enabled;
 @property (nonatomic, assign) BOOL bgEnabled;
@@ -152,7 +198,6 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
 @property (nonatomic, assign) double kbOffset;
 @end
 
-// 颜色插值（分类声明放在使用之前）
 @interface WTEConfig (Gradient)
 + (UIColor *)interpolateFrom:(UIColor *)a to:(UIColor *)b t:(double)t;
 @end
@@ -165,20 +210,18 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
     c.enabled = WTE_BoolPref(kKeyEnabled, YES);
     if (!c.enabled) return c;
 
-    // 1. 键盘背景
     c.bgEnabled           = WTE_BoolPref(kKeyBgEnabled, NO);
     c.bgMode              = WTE_StringPref(kKeyBgMode, @"solid");
     c.bgColor             = WTE_ColorFromHex(WTE_StringPref(kKeyBgColor, @"#1C1C1E")) ?: [UIColor clearColor];
     c.bgAlpha             = WTE_DoublePref(kKeyBgAlpha, 1.0);
     c.keyboardTransparent = WTE_BoolPref(kKeyKeyboardTransparent, NO);
 
-    // 背景图片：优先读沙盒文件，其次读内联 base64/NSData
-    NSString *imgPath = @"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png";
-    NSString *imgPathJB = @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/bg.png";
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *useImg = nil;
-    if ([fm fileExistsAtPath:imgPath]) useImg = imgPath;
-    else if ([fm fileExistsAtPath:imgPathJB]) useImg = imgPathJB;
+    for (NSString *p in @[@"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png",
+                          @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/bg.png"]) {
+        if ([fm fileExistsAtPath:p]) { useImg = p; break; }
+    }
     if (useImg) {
         c.bgImage = [UIImage imageWithContentsOfFile:useImg];
     } else {
@@ -188,7 +231,6 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
         }
     }
 
-    // 2. 按键配色
     c.keyColorEnabled   = WTE_BoolPref(kKeyKeyColorEnabled, NO);
     c.keyLetterBg       = WTE_ColorFromHex(WTE_StringPref(kKeyKeyLetterBg, @"#FFFFFF"));
     c.keyDigitBg        = WTE_ColorFromHex(WTE_StringPref(kKeyKeyDigitBg, @"#FFD166"));
@@ -198,25 +240,21 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
     c.keyTextColor      = WTE_ColorFromHex(WTE_StringPref(kKeyKeyTextColor, @"#000000"));
     c.keyHighlightColor = WTE_ColorFromHex(WTE_StringPref(kKeyKeyHighlightColor, @"#D9D9D9"));
 
-    // 3. 皮肤与字母渐变
     c.skinEnabled           = WTE_BoolPref(kKeySkinEnabled, NO);
     c.letterGradientEnabled = WTE_BoolPref(kKeyLetterGradientEnabled, NO);
     c.letterGradientFrom    = WTE_ColorFromHex(WTE_StringPref(kKeyLetterGradientFrom, @"#5AC8FA"));
     c.letterGradientTo      = WTE_ColorFromHex(WTE_StringPref(kKeyLetterGradientTo, @"#AF52DE"));
     c.letterColorMap        = WTE_GetPref(kKeyLetterColorMap);
 
-    // 4. 按键形状
     c.keyShape        = WTE_StringPref(kKeyKeyShape, @"rounded");
     c.keyCap3D        = WTE_BoolPref(kKeyKeyCap3D, NO);
     c.keyCornerRadius = WTE_DoublePref(kKeyKeyCornerRadius, 5.0);
 
-    // 5. 工具栏布局
     c.tbKeepNativeSize   = WTE_BoolPref(kKeyTbKeepNativeSize, YES);
     c.tbHorizontalScroll = WTE_BoolPref(kKeyTbHorizontalScroll, NO);
     c.tbFillRow          = WTE_BoolPref(kKeyTbFillRow, NO);
     c.tbEditNoFill       = WTE_BoolPref(kKeyTbEditNoFill, YES);
 
-    // 6. 键盘位移
     c.kbOffset = WTE_DoublePref(kKeyKbOffset, 0.0);
 
     return c;
@@ -235,64 +273,115 @@ static void WTE_PrefsChangedCallback(CFNotificationCenterRef center, void *obser
                                      CFDictionaryRef userInfo) {
     dispatch_async(gPrefQueue, ^{
         WTE_ReloadConfig();
-        // 配置变化后，让微信输入法整条视图树重新走一遍 layout
         dispatch_async(dispatch_get_main_queue(), ^{
             for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
                 if (![scene isKindOfClass:[UIWindowScene class]]) continue;
                 for (UIWindow *w in ((UIWindowScene *)scene).windows) {
                     [w setNeedsLayout];
+                    [w _wte_relayoutTree];
                 }
             }
         });
     });
 }
 
-#pragma mark - ========== 按键外观辅助 ==========
+#pragma mark - ========== 按键类型判定（通用启发式，不依赖固定类名） ==========
 
-// 判断按键类型 —— 微信输入法键盘按键的文字/类名规律
 typedef NS_ENUM(NSInteger, WTEKeyKind) {
-    WTEKeyKindLetter = 0,   // 字母键
-    WTEKeyKindDigit,        // 数字键
-    WTEKeyKindFuncLeft,     // 左侧功能键（shift / 123 等）
-    WTEKeyKindFuncRight,    // 右侧功能键（退格 / 回车 等）
-    WTEKeyKindSpace,        // 空格
+    WTEKeyKindLetter = 0,
+    WTEKeyKindDigit,
+    WTEKeyKindFuncLeft,
+    WTEKeyKindFuncRight,
+    WTEKeyKindSpace,
     WTEKeyKindOther,
 };
 
-static WTEKeyKind WTE_KeyKindForView(UIView *v) {
-    NSString *cls = NSStringFromClass([v class]);
-    if ([cls containsString:@"Return"])  return WTEKeyKindFuncRight;
-    if ([cls containsString:@"Sec"])     return WTEKeyKindFuncRight;
-    if ([cls containsString:@"Rule"])    return WTEKeyKindOther;
-
-    // 拿按键文字判断
-    NSString *text = nil;
-    if ([v respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-        UILabel *lbl = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"titleLabel"));
-        if ([lbl isKindOfClass:[UILabel class]]) text = lbl.text;
+// 取视图上的文字（兼容 titleLabel / text / 首个 UILabel 子视图）
+static NSString *WTE_TextOfView(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length) return t;
     }
-    if (!text) {
-        SEL s = NSSelectorFromString(@"text");
-        if ([v respondsToSelector:s]) {
-            id t = ((id (*)(id, SEL))objc_msgSend)(v, s);
-            if ([t isKindOfClass:[NSString class]]) text = t;
+    SEL s = NSSelectorFromString(@"titleLabel");
+    if ([v respondsToSelector:s]) {
+        id lbl = ((id (*)(id, SEL))objc_msgSend)(v, s);
+        if ([lbl isKindOfClass:[UILabel class]] && [(UILabel *)lbl text].length) {
+            return [(UILabel *)lbl text];
         }
     }
+    s = NSSelectorFromString(@"text");
+    if ([v respondsToSelector:s]) {
+        id t = ((id (*)(id, SEL))objc_msgSend)(v, s);
+        if ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) return t;
+    }
+    // 兜底：扫一层子视图找 UILabel
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UILabel class]] && ((UILabel *)sub).text.length) {
+            return ((UILabel *)sub).text;
+        }
+    }
+    return nil;
+}
+
+static UILabel *WTE_LabelOfView(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
+    SEL s = NSSelectorFromString(@"titleLabel");
+    if ([v respondsToSelector:s]) {
+        id lbl = ((id (*)(id, SEL))objc_msgSend)(v, s);
+        if ([lbl isKindOfClass:[UILabel class]]) return lbl;
+    }
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UILabel class]]) return (UILabel *)sub;
+    }
+    return nil;
+}
+
+// 类名特征分流：这是不是「按键」/「键盘容器」/「候选栏」/「工具栏」
+static BOOL WTE_NameIsKey(NSString *cls) {
+    if ([cls containsString:@"Keyboard"]) return NO;   // 排除容器
+    if ([cls containsString:@"Key"])     return YES;
+    if ([cls containsString:@"Button"] && [cls containsString:@"KB"]) return YES;
+    return NO;
+}
+static BOOL WTE_NameIsKeyboard(NSString *cls) {
+    if ([cls containsString:@"Keyboard"]) return YES;
+    if ([cls containsString:@"InputView"]) return YES;
+    if ([cls containsString:@"RootInput"]) return YES;
+    if ([cls containsString:@"MainInput"]) return YES;
+    return NO;
+}
+static BOOL WTE_NameIsCandidate(NSString *cls) {
+    return [cls containsString:@"Candidate"];
+}
+static BOOL WTE_NameIsBar(NSString *cls) {
+    if ([cls containsString:@"ToolBar"]) return YES;
+    if ([cls containsString:@"TopBar"]) return YES;
+    if ([cls containsString:@"Arrange"]) return YES;
+    if ([cls containsString:@"Panel"]) return YES;
+    return NO;
+}
+
+static WTEKeyKind WTE_KeyKindForView(UIView *v) {
+    NSString *cls = NSStringFromClass([v class]);
+    if ([cls containsString:@"Return"] || [cls containsString:@"Sec"] || [cls containsString:@"Backspace"]) {
+        return WTEKeyKindFuncRight;
+    }
+
+    NSString *text = WTE_TextOfView(v);
     if (text.length == 0) return WTEKeyKindLetter;
 
-    if ([text isEqualToString:@" "]) return WTEKeyKindSpace;
-    if ([text rangeOfCharacterFromSet:[NSCharacterSet decimalDigitCharacterSet]].location != NSNotFound
-        && text.length <= 3) {
+    if ([text isEqualToString:@" "] || [text containsString:@"空格"]) return WTEKeyKindSpace;
+
+    if (text.length <= 3 &&
+        [text rangeOfCharacterFromSet:[NSCharacterSet decimalDigitCharacterSet]].location != NSNotFound) {
         return WTEKeyKindDigit;
     }
-    if ([text isEqualToString:@"⇧"] || [text isEqualToString:@"⇪"] ||
-        [text isEqualToString:@"#+="] || [text isEqualToString:@"123"] ||
-        [text isEqualToString:@"ABC"] || [text isEqualToString:@"中"]) {
-        return WTEKeyKindFuncLeft;
-    }
+    NSArray *leftKeys = @[@"⇧", @"⇪", @"#+=", @"123", @"ABC", @"中", @"英", @"中英"];
+    if ([leftKeys containsObject:text]) return WTEKeyKindFuncLeft;
+
     if ([text isEqualToString:@"⌫"] || [text isEqualToString:@"⌦"] ||
-        [text isEqualToString:@"换行"] || [text isEqualToString:@"return"] ||
-        [text length] == 0) {
+        [text containsString:@"换行"] || [text isEqualToString:@"return"] ||
+        [text containsString:@"发送"] || [text containsString:@"完成"]) {
         return WTEKeyKindFuncRight;
     }
     return WTEKeyKindLetter;
@@ -300,18 +389,16 @@ static WTEKeyKind WTE_KeyKindForView(UIView *v) {
 
 static UIColor *WTE_ColorForKeyKind(WTEKeyKind kind, WTEConfig *c) {
     switch (kind) {
-        case WTEKeyKindLetter:     return c.keyLetterBg;
-        case WTEKeyKindDigit:      return c.keyDigitBg;
-        case WTEKeyKindFuncLeft:   return c.keyFuncLeftBg;
-        case WTEKeyKindFuncRight:  return c.keyFuncRightBg;
-        case WTEKeyKindSpace:      return c.keySpaceBg;
-        default:                   return nil;
+        case WTEKeyKindLetter:    return c.keyLetterBg;
+        case WTEKeyKindDigit:     return c.keyDigitBg;
+        case WTEKeyKindFuncLeft:  return c.keyFuncLeftBg;
+        case WTEKeyKindFuncRight: return c.keyFuncRightBg;
+        case WTEKeyKindSpace:     return c.keySpaceBg;
+        default:                  return nil;
     }
 }
 
-// 字母渐变取色：按字母在键盘中的顺序映射到 from→to
 static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
-    // 先查自定义映射表
     if ([c.letterColorMap isKindOfClass:[NSDictionary class]]) {
         NSString *k = [[NSString stringWithFormat:@"%C", ch] lowercaseString];
         id hex = c.letterColorMap[k] ?: c.letterColorMap[[k uppercaseString]];
@@ -321,19 +408,12 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
         }
     }
     if (!c.letterGradientEnabled) return nil;
-    if (ch >= 'a' && ch <= 'z') {
-        double t = (double)(ch - 'a') / 25.0;
-        return [WTEConfig interpolateFrom:c.letterGradientFrom to:c.letterGradientTo t:t];
-    }
-    if (ch >= 'A' && ch <= 'Z') {
-        double t = (double)(ch - 'A') / 25.0;
-        return [WTEConfig interpolateFrom:c.letterGradientFrom to:c.letterGradientTo t:t];
-    }
-    if (ch >= '0' && ch <= '9') {
-        double t = (double)(ch - '0') / 9.0;
-        return [WTEConfig interpolateFrom:c.letterGradientFrom to:c.letterGradientTo t:t];
-    }
-    return nil;
+    double t = -1;
+    if (ch >= 'a' && ch <= 'z') t = (double)(ch - 'a') / 25.0;
+    else if (ch >= 'A' && ch <= 'Z') t = (double)(ch - 'A') / 25.0;
+    else if (ch >= '0' && ch <= '9') t = (double)(ch - '0') / 9.0;
+    if (t < 0) return nil;
+    return [WTEConfig interpolateFrom:c.letterGradientFrom to:c.letterGradientTo t:t];
 }
 
 @implementation WTEConfig (Gradient)
@@ -352,104 +432,93 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
 }
 @end
 
-#pragma mark - ========== 背景图铺满绘制 ==========
+#pragma mark - ========== 背景图铺满 ==========
 
 @interface WTEBackgroundView : UIImageView
 @end
 @implementation WTEBackgroundView
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // 保持比例铺满，不拉伸变形（等价原插件的 cropToKeyboardAspect）
-    if (!self.image) return;
-    CGSize bs = self.bounds.size;
+    if (!self.image || !self.superview) return;
+    CGSize bs = self.superview.bounds.size;
     CGSize is = self.image.size;
     if (bs.width <= 0 || bs.height <= 0 || is.width <= 0 || is.height <= 0) return;
     CGFloat scale = MAX(bs.width / is.width, bs.height / is.height);
     CGFloat w = is.width * scale, h = is.height * scale;
-    self.frame = CGRectMake(self.superview.bounds.origin.x + (bs.width - w) / 2.0,
-                            self.superview.bounds.origin.y + (bs.height - h) / 2.0,
-                            w, h);
+    self.frame = CGRectMake((bs.width - w) / 2.0, (bs.height - h) / 2.0, w, h);
 }
 @end
 
-#pragma mark - ========== Hook: WBKeyboardView（键盘整体） ==========
+#pragma mark - ========== 视图树重排辅助 ==========
 
-static void (*orig_WBKeyboardView_layoutSubviews)(UIView *, SEL);
+@implementation UIView (WTEEnhance)
+- (void)_wte_relayoutTree {
+    [self setNeedsLayout];
+    for (UIView *sub in self.subviews) [sub _wte_relayoutTree];
+}
+@end
 
-static void WTE_WBKeyboardView_layoutSubviews(UIView *self, SEL _cmd) {
-    orig_WBKeyboardView_layoutSubviews(self, _cmd);
+#pragma mark - ========== 核心：把配置应用到单个视图 ==========
 
-    WTEConfig *c = gConfig;
-    if (!c || !c.enabled) return;
+static const void *kWTEKBGKey   = &kWTEKBGKey;    // 键盘背景层
+static const void *kWTEStyledKey = &kWTEStyledKey; // 本轮是否已处理
+static Class gKBRootClass = Nil;                  // 记录最外层的键盘容器类
 
-    static const void *kBgTagKey = &kBgTagKey;
-    UIView *bg = objc_getAssociatedObject(self, kBgTagKey);
-
+static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
+    UIView *bg = objc_getAssociatedObject(self, kWTEKBGKey);
     BOOL needBg = c.bgEnabled || c.keyboardTransparent ||
-                  [c.bgMode isEqualToString:@"image"] || [c.bgMode isEqualToString:@"transparent"];
+                  [c.bgMode isEqualToString:@"transparent"] || [c.bgMode isEqualToString:@"image"];
     if (!needBg) {
-        if (bg) { [bg removeFromSuperview]; objc_setAssociatedObject(self, kBgTagKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-        return;
-    }
-
-    // 整键盘透明：把键盘自身背景抹掉
-    if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
-        self.backgroundColor = [UIColor clearColor];
-        self.opaque = NO;
-        if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
+        if (bg) {
+            [bg removeFromSuperview];
+            objc_setAssociatedObject(self, kWTEKBGKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-    }
-
-    if (!bg) {
-        bg = [[UIView alloc] initWithFrame:self.bounds];
-        bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        bg.userInteractionEnabled = NO;
-        [self insertSubview:bg atIndex:0];
-        objc_setAssociatedObject(self, kBgTagKey, bg, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    bg.frame = self.bounds;
-
-    // 清掉旧的背景图子视图
-    for (UIView *sub in [bg.subviews copy]) {
-        if ([sub isKindOfClass:[WTEBackgroundView class]]) [sub removeFromSuperview];
-    }
-
-    if ([c.bgMode isEqualToString:@"image"] && c.bgImage) {
-        bg.backgroundColor = [UIColor clearColor];
-        WTEBackgroundView *iv = [[WTEBackgroundView alloc] initWithImage:c.bgImage];
-        iv.contentMode = UIViewContentModeScaleAspectFill;
-        iv.clipsToBounds = YES;
-        iv.userInteractionEnabled = NO;
-        iv.frame = bg.bounds;
-        [bg addSubview:iv];
-    } else if ([c.bgMode isEqualToString:@"transparent"] || c.keyboardTransparent) {
-        bg.backgroundColor = [UIColor clearColor];
     } else {
-        bg.backgroundColor = [c.bgColor colorWithAlphaComponent:c.bgAlpha];
+        if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
+            self.backgroundColor = [UIColor clearColor];
+            self.opaque = NO;
+            if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
+            }
+        }
+        if (!bg) {
+            bg = [[UIView alloc] initWithFrame:self.bounds];
+            bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            bg.userInteractionEnabled = NO;
+            [self insertSubview:bg atIndex:0];
+            objc_setAssociatedObject(self, kWTEKBGKey, bg, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        bg.frame = self.bounds;
+        for (UIView *sub in [bg.subviews copy]) {
+            if ([sub isKindOfClass:[WTEBackgroundView class]]) [sub removeFromSuperview];
+        }
+        if ([c.bgMode isEqualToString:@"image"] && c.bgImage) {
+            bg.backgroundColor = [UIColor clearColor];
+            WTEBackgroundView *iv = [[WTEBackgroundView alloc] initWithImage:c.bgImage];
+            iv.contentMode = UIViewContentModeScaleAspectFill;
+            iv.clipsToBounds = YES;
+            iv.userInteractionEnabled = NO;
+            iv.frame = bg.bounds;
+            [bg addSubview:iv];
+        } else if ([c.bgMode isEqualToString:@"transparent"] || c.keyboardTransparent) {
+            bg.backgroundColor = [UIColor clearColor];
+        } else {
+            bg.backgroundColor = [c.bgColor colorWithAlphaComponent:c.bgAlpha];
+        }
     }
 
     // 键盘整体位移
     if (c.kbOffset != 0.0) {
         self.transform = CGAffineTransformMakeTranslation(0, c.kbOffset);
-    } else {
+    } else if (self.transform.ty != 0 || self.transform.tx != 0) {
         self.transform = CGAffineTransformIdentity;
     }
 }
 
-#pragma mark - ========== Hook: WBKeyView（单个按键） ==========
-
-static void (*orig_WBKeyView_layoutSubviews)(UIView *, SEL);
-
-static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
-    orig_WBKeyView_layoutSubviews(self, _cmd);
-
-    WTEConfig *c = gConfig;
-    if (!c || !c.enabled) return;
-
+static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
     WTEKeyKind kind = WTE_KeyKindForView(self);
 
-    // 按键形状：圆角 / 3D 键帽
+    // 形状
     if ([c.keyShape isEqualToString:@"circle"]) {
         self.layer.cornerRadius = MIN(self.bounds.size.width, self.bounds.size.height) / 2.0;
         self.layer.masksToBounds = YES;
@@ -461,7 +530,7 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
         self.layer.masksToBounds = YES;
         self.layer.borderWidth = 1.0;
         self.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.35] CGColor];
-    } else { // rounded
+    } else {
         self.layer.cornerRadius = c.keyCornerRadius;
         self.layer.masksToBounds = YES;
     }
@@ -478,40 +547,39 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
         self.layer.shadowOpacity = 0.0;
     }
 
-    // 按键配色
+    // 底色
     if (c.keyColorEnabled) {
         UIColor *col = WTE_ColorForKeyKind(kind, c);
-        if (col) self.backgroundColor = col;
-    }
-
-    // 文字颜色
-    if (c.keyColorEnabled && c.keyTextColor) {
-        UILabel *lbl = nil;
-        if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            lbl = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
-        }
-        if ([lbl isKindOfClass:[UILabel class]]) lbl.textColor = c.keyTextColor;
-        // 有些版本的 WBKeyView 直接是 UILabel 子类 / 内嵌
-        if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = c.keyTextColor;
-    }
-
-    // 字母渐变
-    if (c.letterGradientEnabled || [c.letterColorMap count] > 0) {
-        UILabel *lbl = nil;
-        if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            lbl = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
-        }
-        NSString *txt = ([lbl isKindOfClass:[UILabel class]]) ? lbl.text : nil;
-        if (txt.length >= 1) {
-            UIColor *gc = WTE_GradientColorForLetter([txt characterAtIndex:0], c);
-            if (gc) {
-                if ([lbl isKindOfClass:[UILabel class]]) lbl.textColor = gc;
-                else if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = gc;
+        if (col) {
+            self.backgroundColor = col;
+            // 有些按键底色画在子视图上，一并处理一层
+            for (UIView *sub in self.subviews) {
+                if (![sub isKindOfClass:[UILabel class]] && sub.subviews.count == 0 &&
+                    sub.bounds.size.height >= self.bounds.size.height * 0.8 &&
+                    sub.bounds.size.width  >= self.bounds.size.width  * 0.8) {
+                    sub.backgroundColor = col;
+                }
             }
         }
     }
 
-    // 高亮色（按下态）
+    UILabel *lbl = WTE_LabelOfView(self);
+
+    // 文字颜色
+    if (c.keyColorEnabled && c.keyTextColor && lbl) {
+        lbl.textColor = c.keyTextColor;
+    }
+
+    // 字母渐变
+    if ((c.letterGradientEnabled || [c.letterColorMap count] > 0) && lbl) {
+        NSString *txt = lbl.text;
+        if (txt.length >= 1) {
+            UIColor *gc = WTE_GradientColorForLetter([txt characterAtIndex:0], c);
+            if (gc) lbl.textColor = gc;
+        }
+    }
+
+    // 按下高亮色
     if (c.keyColorEnabled && c.keyHighlightColor) {
         SEL s = NSSelectorFromString(@"setHighlightedBackgroundColor:");
         if ([self respondsToSelector:s]) {
@@ -520,84 +588,162 @@ static void WTE_WBKeyView_layoutSubviews(UIView *self, SEL _cmd) {
     }
 }
 
-#pragma mark - ========== Hook: WBCandidateView / 候选栏 ==========
-
-static void (*orig_WBCandidateView_layoutSubviews)(UIView *, SEL);
-
-static void WTE_WBCandidateView_layoutSubviews(UIView *self, SEL _cmd) {
-    orig_WBCandidateView_layoutSubviews(self, _cmd);
-    WTEConfig *c = gConfig;
-    if (!c || !c.enabled) return;
-
+static void WTE_ApplyBarOrCandidate(UIView *self, WTEConfig *c) {
     if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
         self.backgroundColor = [UIColor clearColor];
     }
     if (c.keyColorEnabled && c.keyTextColor) {
         if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = c.keyTextColor;
-        else if ([self respondsToSelector:NSSelectorFromString(@"titleLabel")]) {
-            UILabel *l = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"titleLabel"));
-            if ([l isKindOfClass:[UILabel class]]) l.textColor = c.keyTextColor;
+        else {
+            UILabel *l = WTE_LabelOfView(self);
+            if (l) l.textColor = c.keyTextColor;
         }
     }
 }
 
-#pragma mark - ========== Hook: WBTopBar / WBArrangeView / 工具栏布局 ==========
-
-static void (*orig_WBTopBar_layoutSubviews)(UIView *, SEL);
-
-static void WTE_WBTopBar_layoutSubviews(UIView *self, SEL _cmd) {
-    WTEConfig *c = gConfig;
-    if (c && c.enabled) {
-        // 工具栏自动填充整行
-        if (c.tbFillRow) {
-            self.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        }
-        // 编辑态不填充
-        if (c.tbEditNoFill) {
-            UIResponder *r = [self nextResponder];
-            if ([r isKindOfClass:[UIView class]]) {
-                NSString *rc = NSStringFromClass([r class]);
-                if ([rc containsString:@"Edit"]) {
-                    // 编辑态保持原尺寸
-                }
-            }
-        }
-        if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
-            self.backgroundColor = [UIColor clearColor];
-        }
-    }
-    orig_WBTopBar_layoutSubviews(self, _cmd);
-}
-
-static void (*orig_WBArrangeView_layoutSubviews)(UIView *, SEL);
-
-static void WTE_WBArrangeView_layoutSubviews(UIView *self, SEL _cmd) {
-    orig_WBArrangeView_layoutSubviews(self, _cmd);
+// 统一入口：按类名特征分派
+static void WTE_ApplyToView(UIView *self) {
     WTEConfig *c = gConfig;
     if (!c || !c.enabled) return;
 
-    if (c.tbKeepNativeSize) {
-        // 保持原生尺寸，不参与拉伸
-        self.autoresizingMask = UIViewAutoresizingNone;
-    }
-    if (c.tbHorizontalScroll) {
-        for (UIView *sub in self.subviews) {
-            sub.autoresizingMask = UIViewAutoresizingNone;
-        }
-    }
-    if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
-        self.backgroundColor = [UIColor clearColor];
+    NSString *cls = NSStringFromClass([self class]);
+    if (cls.length == 0) return;
+
+    if (WTE_NameIsKeyboard(cls)) {
+        WTE_ApplyKeyboardBg(self, c);
+    } else if (WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls)) {
+        WTE_ApplyBarOrCandidate(self, c);
+    } else if (WTE_NameIsKey(cls)) {
+        WTE_ApplyKeyAppearance(self, c);
     }
 }
 
-#pragma mark - ========== 构造期 hook ==========
+#pragma mark - ========== 动态 hook ==========
 
-static void (*orig_WBKeyView_didMoveToWindow)(UIView *, SEL);
+static NSMutableDictionary *gOrigLayout;   // Class -> NSValue(IMP)
+static NSMutableDictionary *gOrigMove;     // Class -> NSValue(IMP)
+static NSMutableArray *gHookedClasses;
 
-static void WTE_WBKeyView_didMoveToWindow(UIView *self, SEL _cmd) {
-    orig_WBKeyView_didMoveToWindow(self, _cmd);
-    // 进入窗口后再刷一次，规避时序问题
-    [self setNeedsLayout];
+static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
+    // 防止同一对象在 orig 链中被重复处理
+    if (!objc_getAssociatedObject(self, kWTEStyledKey)) {
+        @try {
+            objc_setAssociatedObject(self, kWTEStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            WTE_ApplyToView(self);
+            objc_setAssociatedObject(self, kWTEStyledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } @catch (__unused NSException *e) {}
+    }
+
+    NSValue *v = gOrigLayout[NSStringFromClass([self class])];
+    if (v) ((void (*)(id, SEL))v.pointerValue)(self, _cmd);
+}
+
+static void WTE_MoveReplacement(UIView *self, SEL _cmd) {
+    NSValue *v = gOrigMove[NSStringFromClass([self class])];
+    if (v) ((void (*)(id, SEL))v.pointerValue)(self, _cmd);
+
+    @try {
+        if (!objc_getAssociatedObject(self, kWTEStyledKey)) {
+            objc_setAssociatedObject(self, kWTEStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            WTE_ApplyToView(self);
+            objc_setAssociatedObject(self, kWTEStyledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    } @catch (__unused NSException *e) {}
+
+    // 记录布局期见到的类（诊断用）
+#if WTE_LOG_ENABLE
+    NSString *cls = NSStringFromClass([self class]);
+    if (gLayoutSeen.count < 120 && ![gLayoutSeen containsObject:cls]) {
+        [gLayoutSeen addObject:cls];
+        NSString *txt = WTE_TextOfView(self);
+        WTE_Diag(@"layered: %@ text=%@ frame=%@", cls, txt ?: @"-", NSStringFromCGRect(self.frame));
+    }
+#endif
+}
+
+static void WTE_HookClassForLayout(Class c) {
+    if (!c) return;
+    NSString *name = NSStringFromClass(c);
+    if (!name.length) return;
+    if (gHookedClasses && [gHookedClasses containsObject:name]) return;
+
+    SEL layoutSel = @selector(layoutSubviews);
+    Method m = class_getInstanceMethod(c, layoutSel);
+    if (!m) return;
+
+    IMP prev = NULL;
+    MSHookMessageEx(c, layoutSel, (IMP)&WTE_LayoutReplacement, (IMP *)&prev);
+    if (prev) gOrigLayout[name] = [NSValue valueWithPointer:prev];
+
+    SEL moveSel = @selector(didMoveToWindow);
+    Method m2 = class_getInstanceMethod(c, moveSel);
+    if (m2) {
+        IMP prev2 = NULL;
+        MSHookMessageEx(c, moveSel, (IMP)&WTE_MoveReplacement, (IMP *)&prev2);
+        if (prev2) gOrigMove[name] = [NSValue valueWithPointer:prev2];
+    }
+
+    if (!gHookedClasses) gHookedClasses = [NSMutableArray new];
+    [gHookedClasses addObject:name];
+}
+
+// 类名是否符合 hook 目标特征
+static BOOL WTE_NameLooksInteresting(NSString *n) {
+    if (!n.length) return NO;
+    if ([n hasPrefix:@"UI"] && ![n containsString:@"Keyboard"]) return NO;   // 少动系统 UI 类
+    if ([n containsString:@"Keyboard"]) return YES;
+    if ([n containsString:@"Key"]) return YES;
+    if ([n containsString:@"Candidate"]) return YES;
+    if ([n containsString:@"ToolBar"]) return YES;
+    if ([n containsString:@"TopBar"]) return YES;
+    if ([n containsString:@"Arrange"]) return YES;
+    if ([n containsString:@"InputView"]) return YES;
+    if ([n containsString:@"RootInput"]) return YES;
+    if ([n containsString:@"MainInput"]) return YES;
+    if ([n hasPrefix:@"WB"]) return YES;
+    if ([n hasPrefix:@"Tx"]) return YES;
+    return NO;
+}
+
+static int WTE_ScanAndHookClasses(void) {
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return 0;
+    Class *classes = (Class *)malloc(sizeof(Class) * count);
+    if (!classes) return 0;
+    count = objc_getClassList(classes, count);
+
+    NSMutableArray *candidates = [NSMutableArray array];
+    NSMutableArray *allNames = [NSMutableArray array];
+
+    for (int i = 0; i < count; i++) {
+        Class c = classes[i];
+        NSString *n = NSStringFromClass(c);
+        if (!n.length) continue;
+
+        // 只关心 UIView 体系
+        BOOL isView = NO;
+        Class s = c;
+        while (s) {
+            if (s == [UIView class]) { isView = YES; break; }
+            s = class_getSuperclass(s);
+        }
+        if (!isView) continue;
+
+        if (WTE_NameLooksInteresting(n)) {
+            [candidates addObject:n];
+            [allNames addObject:n];
+        }
+    }
+    free(classes);
+
+    [allNames sortUsingSelector:@selector(compare:)];
+    WTE_Diag(@"=== 候选类扫描：共 %d 个 UIView 类命中特征 ===", (int)allNames.count);
+    for (NSString *n in allNames) WTE_Diag(@"  class %@", n);
+
+    for (NSString *n in candidates) {
+        WTE_HookClassForLayout(NSClassFromString(n));
+    }
+    return (int)candidates.count;
 }
 
 #pragma mark - ========== 初始化 ==========
@@ -605,16 +751,34 @@ static void WTE_WBKeyView_didMoveToWindow(UIView *self, SEL _cmd) {
 __attribute__((constructor))
 static void WTE_Init(void) {
     gPrefQueue = dispatch_queue_create("com.colorblack.wetypeenhance.prefs", DISPATCH_QUEUE_SERIAL);
+#if WTE_LOG_ENABLE
+    gDiagQueue = dispatch_queue_create("com.colorblack.wetypeenhance.diag", DISPATCH_QUEUE_SERIAL);
+    gLayoutSeen = [NSMutableSet new];
+#endif
+    gOrigLayout = [NSMutableDictionary new];
+    gOrigMove = [NSMutableDictionary new];
 
     NSBundle *bundle = [NSBundle mainBundle];
     NSString *bundleID = [bundle bundleIdentifier];
     NSString *execName = [[NSProcessInfo processInfo] processName];
 
-    NSLog(@"[WeTypeEnhance] loaded pid=%d bundle=%@ exec=%@", getpid(), bundleID, execName);
-
     WTE_ReloadConfig();
 
-    // 偏好变更监听
+    WTE_Diag(@"================ WeTypeEnhance v1.1.0 ================");
+    WTE_Diag(@"pid=%d bundle=%@ exec=%@", getpid(), bundleID, execName);
+    WTE_Diag(@"--- 偏好可读性检查 ---");
+    for (NSString *p in WTE_PrefCandidates()) {
+        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:p];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        WTE_Diag(@"  %@ exists=%d keys=%d", p, exists, (int)d.count);
+    }
+    WTE_Diag(@"--- 当前配置 ---");
+    WTE_Diag(@"  enabled=%d bgEnabled=%d bgMode=%@ keyColorEnabled=%d skinEnabled=%d kbOffset=%.1f",
+             gConfig.enabled, gConfig.bgEnabled, gConfig.bgMode,
+             gConfig.keyColorEnabled, gConfig.skinEnabled, gConfig.kbOffset);
+    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:WTE_PrefPath()];
+    WTE_Diag(@"  raw prefs = %@", raw);
+
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
                                     WTE_PrefsChangedCallback,
@@ -622,36 +786,10 @@ static void WTE_Init(void) {
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // ---- hook 各输入法类（存在才 hook，避免跨版本崩溃） ----
-    Class kbd = objc_getClass("WBKeyboardView");
-    if (kbd) MSHookMessageEx(kbd, @selector(layoutSubviews),
-                             (IMP)&WTE_WBKeyboardView_layoutSubviews,
-                             (IMP *)&orig_WBKeyboardView_layoutSubviews);
-
-    Class key = objc_getClass("WBKeyView");
-    if (key) {
-        MSHookMessageEx(key, @selector(layoutSubviews),
-                        (IMP)&WTE_WBKeyView_layoutSubviews,
-                        (IMP *)&orig_WBKeyView_layoutSubviews);
-        MSHookMessageEx(key, @selector(didMoveToWindow),
-                        (IMP)&WTE_WBKeyView_didMoveToWindow,
-                        (IMP *)&orig_WBKeyView_didMoveToWindow);
-    }
-
-    Class cand = objc_getClass("WBCandidateView");
-    if (cand) MSHookMessageEx(cand, @selector(layoutSubviews),
-                              (IMP)&WTE_WBCandidateView_layoutSubviews,
-                              (IMP *)&orig_WBCandidateView_layoutSubviews);
-
-    Class topbar = objc_getClass("WBTopBar");
-    if (topbar) MSHookMessageEx(topbar, @selector(layoutSubviews),
-                                (IMP)&WTE_WBTopBar_layoutSubviews,
-                                (IMP *)&orig_WBTopBar_layoutSubviews);
-
-    Class arrange = objc_getClass("WBArrangeView");
-    if (arrange) MSHookMessageEx(arrange, @selector(layoutSubviews),
-                                 (IMP)&WTE_WBArrangeView_layoutSubviews,
-                                 (IMP *)&orig_WBArrangeView_layoutSubviews);
-
-    NSLog(@"[WeTypeEnhance] hooks installed pid=%d bundle=%@", getpid(), bundleID);
+    // 类扫描 + 动态 hook（延迟到主线程，等 dyld 把输入法类都注册好）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        int hooked = WTE_ScanAndHookClasses();
+        WTE_Diag(@"=== 已 hook %d 个类 ===", hooked);
+        WTE_DiagFlush(@"scan");
+    });
 }
