@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = WeTypeEnhancePrefs
 
-WeTypeEnhancePrefs_FILES = WTERootListController.m
+WeTypeEnhancePrefs_FILES = WTERootListController.m WTECommonImpl.m
 WeTypeEnhancePrefs_INSTALL_PATH = /Library/PreferenceBundles
 WeTypeEnhancePrefs_FRAMEWORKS = UIKit PhotosUI
 WeTypeEnhancePrefs_RESOURCE_FILES = Info.plist Root.plist icon.png
