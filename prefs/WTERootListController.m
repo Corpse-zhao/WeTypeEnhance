@@ -3,6 +3,7 @@
 // 完整图形界面：开关 / 滑块 / 取色器 / 相册选图 / 预设 / 重置
 
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #import <PhotosUI/PhotosUI.h>
 #import "../WeTypeEnhanceCommon.h"
 
