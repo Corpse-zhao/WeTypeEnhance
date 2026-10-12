@@ -56,11 +56,6 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (void)reloadSpecifier:(PSSpecifier *)spec;
 @end
 
-// 自声明里没有 _specifiers ivar，用自定义存储承接
-@interface WTERootListController ()
-@property (nonatomic, strong) NSArray *wteSpecifiers;
-@end
-
 #pragma mark - 自定义取色单元格
 
 @interface WTEColorCell : PSTableCell
@@ -108,6 +103,11 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 
 @interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) PSSpecifier *pendingSpec;
+@end
+
+// 自声明里没有 _specifiers ivar，用自定义存储承接
+@interface WTERootListController ()
+@property (nonatomic, strong) NSArray *wteSpecifiers;
 @end
 
 @implementation WTERootListController
