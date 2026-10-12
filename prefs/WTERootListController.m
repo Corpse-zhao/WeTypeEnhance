@@ -57,49 +57,6 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (void)reloadSpecifier:(PSSpecifier *)spec;
 @end
 
-#pragma mark - 自定义取色单元格
-
-@interface WTEColorCell : PSTableCell
-@property (nonatomic, strong) UIView *swatch;
-@end
-
-@implementation WTEColorCell
-
-- (instancetype)initWithStyle:(UITableViewCellStyle)style
-              reuseIdentifier:(NSString *)reuseIdentifier
-                    specifier:(PSSpecifier *)specifier {
-    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier specifier:specifier];
-    if (self) {
-        _swatch = [[UIView alloc] initWithFrame:CGRectZero];
-        _swatch.translatesAutoresizingMaskIntoConstraints = NO;
-        _swatch.layer.cornerRadius = 6.0;
-        _swatch.layer.borderWidth = 0.5;
-        _swatch.layer.borderColor = [[UIColor separatorColor] CGColor];
-        [self.contentView addSubview:_swatch];
-        [NSLayoutConstraint activateConstraints:@[
-            [_swatch.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
-            [_swatch.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-20],
-            [_swatch.widthAnchor constraintEqualToConstant:29],
-            [_swatch.heightAnchor constraintEqualToConstant:29],
-        ]];
-    }
-    return self;
-}
-
-- (void)refreshCellContentsWithSpecifier:(PSSpecifier *)specifier {
-    [super refreshCellContentsWithSpecifier:specifier];
-    NSString *hex = [self.specifier propertyForKey:@"hexValue"];
-    if (!hex) {
-        id v = WTE_GetPref([specifier propertyForKey:@"key"]);
-        hex = [v isKindOfClass:[NSString class]] ? v : [specifier propertyForKey:@"defaultHex"];
-    }
-    UIColor *c = WTE_ColorFromHex(hex) ?: [UIColor grayColor];
-    self.swatch.backgroundColor = c;
-    self.detailTextLabel.text = hex;
-}
-
-@end
-
 #pragma mark - 主控制器
 
 @interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate, PHPickerViewControllerDelegate>
@@ -166,42 +123,48 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 }
 
 - (PSSpecifier *)colorRow:(NSString *)title key:(NSString *)key def:(NSString *)def {
+    // 用系统 PSTitleValueCell：get 返回当前 hex 显示在右侧，点击进取色器。
+    // 注意：真实 Preferences 会调用 get/set 刷新 cell，任何一个为 nil 都会把整行禁用（灰掉），
+    // 所以这里 get/set 必须都给。
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
-                                                       set:nil
-                                                       get:nil
+                                                       set:@selector(setColorValue:forSpecifier:)
+                                                       get:@selector(getColorValueForSpecifier:)
                                                     detail:nil
-                                                      cell:(PSCellType)NSClassFromString(@"WTEColorCell")
+                                                      cell:PSTitleValueCell
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
     [s setProperty:def forKey:@"defaultHex"];
-    [s setProperty:def forKey:@"hexValue"];
     [s setProperty:@YES forKey:@"isColorRow"];
     return s;
 }
 
 - (PSSpecifier *)choiceRow:(NSString *)title key:(NSString *)key def:(NSString *)def
                     values:(NSArray *)values titles:(NSArray *)titles {
+    // 点击循环切换：PSButtonCell + get 返回当前中文标题。
+    // 不用 PSLinkListCell（无 detail 控制器时点击无响应）。
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
-                                                       set:@selector(setPref:forSpecifier:)
-                                                       get:@selector(getPrefForSpecifier:)
+                                                       set:@selector(setChoiceValue:forSpecifier:)
+                                                       get:@selector(getChoiceValueForSpecifier:)
                                                     detail:nil
-                                                      cell:PSLinkListCell
+                                                      cell:PSButtonCell
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
     [s setProperty:def forKey:@"defaultValue"];
     [s setProperty:values forKey:@"validValues"];
     [s setProperty:titles forKey:@"validTitles"];
-    [s setProperty:@(0) forKey:@"default"];
+    [s setProperty:@YES forKey:@"isChoiceRow"];
+    [s setButtonAction:@selector(cycleChoice:)];
     return s;
 }
 
 - (PSSpecifier *)buttonRow:(NSString *)title action:(SEL)action {
+    // 按钮行也要给 get/set，否则整行灰掉
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
-                                                       set:nil
-                                                       get:nil
+                                                       set:@selector(setDisplay:forSpecifier:)
+                                                       get:@selector(getDisplayForSpecifier:)
                                                     detail:nil
                                                       cell:PSButtonCell
                                                       edit:nil];
@@ -213,7 +176,7 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (NSArray *)buildSpecifiers {
     NSMutableArray *specs = [NSMutableArray array];
 
-    [specs addObject:[self group:@"微信输入法增强 v1.0.0\n功能对等移植自「原生输入法增强」"]];
+    [specs addObject:[self group:@"微信输入法增强 v1.2.0\n功能对等移植自「原生输入法增强」"]];
     [specs addObject:[self switchRow:@"启用" key:kKeyEnabled def:YES]];
 
     // ---- 1. 键盘背景 ----
@@ -315,12 +278,16 @@ typedef NS_ENUM(NSInteger, PSCellType) {
         UIColorPickerViewController *picker = [[UIColorPickerViewController alloc] init];
         picker.delegate = self;
         picker.supportsAlpha = YES;
-        NSString *cur = [spec propertyForKey:@"hexValue"]
-                        ?: [self prefStringForKey:[spec propertyForKey:@"key"]
-                                     fallback:[spec propertyForKey:@"defaultHex"]];
+        NSString *cur = [self prefStringForKey:[spec propertyForKey:@"key"]
+                                    fallback:[spec propertyForKey:@"defaultHex"]];
         UIColor *c = WTE_ColorFromHex(cur);
         if (c) picker.selectedColor = c;
         [self presentViewController:picker animated:YES completion:nil];
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        return;
+    }
+    if ([[spec propertyForKey:@"isChoiceRow"] boolValue]) {
+        [self cycleChoice:spec];
         [tableView deselectRowAtIndexPath:indexPath animated:YES];
         return;
     }
@@ -330,6 +297,54 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (NSString *)prefStringForKey:(NSString *)key fallback:(NSString *)fallback {
     id v = WTE_GetPref(key);
     return [v isKindOfClass:[NSString class]] ? v : fallback;
+}
+
+#pragma mark - 颜色行 / 选择行 / 按钮行的 get,set
+
+// 颜色行：get 返回当前 hex（显示在 PSTitleValueCell 右侧）
+- (id)getColorValueForSpecifier:(PSSpecifier *)spec {
+    return [self prefStringForKey:[spec propertyForKey:@"key"]
+                         fallback:[spec propertyForKey:@"defaultHex"]];
+}
+- (void)setColorValue:(NSString *)hex forSpecifier:(PSSpecifier *)spec {
+    WTE_SetPref([spec propertyForKey:@"key"], hex);
+    WTE_NotifyChanged();
+}
+
+// 选择行：get 返回当前值对应的中文标题
+- (id)getChoiceValueForSpecifier:(PSSpecifier *)spec {
+    NSString *cur = [self prefStringForKey:[spec propertyForKey:@"key"]
+                                 fallback:[spec propertyForKey:@"defaultValue"]];
+    NSArray *values = [spec propertyForKey:@"validValues"];
+    NSArray *titles = [spec propertyForKey:@"validTitles"];
+    NSUInteger idx = [values indexOfObject:cur];
+    if (idx == NSNotFound || idx >= titles.count) idx = 0;
+    return titles.count ? titles[idx] : cur;
+}
+- (void)setChoiceValue:(id)value forSpecifier:(PSSpecifier *)spec {
+    WTE_SetPref([spec propertyForKey:@"key"], value);
+    WTE_NotifyChanged();
+}
+
+// 点击循环切换到下一个取值
+- (void)cycleChoice:(PSSpecifier *)spec {
+    NSString *cur = [self prefStringForKey:[spec propertyForKey:@"key"]
+                                 fallback:[spec propertyForKey:@"defaultValue"]];
+    NSArray *values = [spec propertyForKey:@"validValues"];
+    NSUInteger idx = [values indexOfObject:cur];
+    if (idx == NSNotFound) idx = 0;
+    NSString *next = values[(idx + 1) % values.count];
+    WTE_SetPref([spec propertyForKey:@"key"], next);
+    WTE_NotifyChanged();
+    [self reloadSpecifiers];
+}
+
+// 按钮行的占位读写（Preferences 要求 get/set 可调用，否则整行灰掉）
+- (id)getDisplayForSpecifier:(PSSpecifier *)spec {
+    return [spec propertyForKey:@"title"] ?: @"";
+}
+- (void)setDisplay:(id)value forSpecifier:(PSSpecifier *)spec {
+    // no-op
 }
 
 - (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {
