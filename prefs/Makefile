@@ -8,7 +8,7 @@ BUNDLE_NAME = WeTypeEnhancePrefs
 WeTypeEnhancePrefs_FILES = WTERootListController.m
 WeTypeEnhancePrefs_INSTALL_PATH = /Library/PreferenceBundles
 WeTypeEnhancePrefs_FRAMEWORKS = UIKit PhotosUI
-WeTypeEnhancePrefs_RESOURCE_FILES = Info.plist Root.plist
+WeTypeEnhancePrefs_RESOURCE_FILES = Info.plist Root.plist icon.png
 
 # Preferences 是 iOS 私有框架：iOS SDK 里没有它的 .tbd，不能直接链接。
 # 它在运行时由 Preferences 进程（设置 App）提供符号，因此：
