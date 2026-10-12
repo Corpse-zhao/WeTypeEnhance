@@ -7,4 +7,3 @@ Maintainer: colorblack
 Author: colorblack
 Section: 输入法皮肤
 Depends: firmware (>= 15.0), mobilesubstrate, preferenceloader
-Installed-Size: 900
