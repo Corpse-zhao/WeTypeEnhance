@@ -407,7 +407,10 @@ static void WTE_ReloadConfig(void) {
 static void WTE_PrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                      CFStringRef name, const void *object,
                                      CFDictionaryRef userInfo) {
-    dispatch_async(gPrefQueue, ^{
+    // 延迟 0.8s：面板发通知的同时 SpringBoard 的「偏好中继」也在写文件，
+    // 等它写完再重读，避免拿到旧配置
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   gPrefQueue, ^{
         WTE_ReloadConfig();
         dispatch_async(dispatch_get_main_queue(), ^{
             for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -903,6 +906,80 @@ static int WTE_InstallHooks(void) {
     return hooked;
 }
 
+#pragma mark - ========== SpringBoard 偏好中继 ==========
+//
+// 1.7.0 实测定论：键盘扩展沙盒里所有偏好通道全部不可读
+//   （连 /var/mobile/Library/Preferences 都读不到，cfprefsd 也会把外部 suite
+//     重定向到扩展自己的容器，所以 NSUserDefaults 兜底也拿不到）。
+// 而 tweak 自己【能写】进键盘容器（diag.txt 写成功了）—— 问题只在「谁把配置送进来」。
+// 面板（Preferences 进程）不一定写得进别的 App 的容器，但 SpringBoard 没有沙盒限制：
+//   读全局偏好 ✅  +  写任意 App 容器 ✅
+// 所以让 SpringBoard 当中继：读全局偏好 → 铺到微信输入法所有相关容器。
+// 装完插件注销一次，配置就已经在键盘容器里了，键盘第一次弹出就能读到。
+
+static NSString *WTE_RelayPushConfig(void) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        NSDictionary *src = [NSDictionary dictionaryWithContentsOfFile:
+            @"/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist"];
+        if (![src isKindOfClass:[NSDictionary class]] || src.count == 0) {
+            src = [NSDictionary dictionaryWithContentsOfFile:
+                @"/var/jb/var/mobile/Library/Preferences/com.colorblack.wetypeenhance.plist"];
+        }
+        if (![src isKindOfClass:[NSDictionary class]] || src.count == 0) {
+            return @"全局偏好文件不存在或为空（还没在面板里设置过）→ 未铺配置。\n"
+                    "去面板里改任意一项设置再注销，或点「同步配置到键盘」。";
+        }
+
+        NSMutableArray *bases = [NSMutableArray array];
+        for (NSString *root in @[@"/var/mobile/Containers/Data/PluginKitPlugin",
+                                 @"/var/mobile/Containers/Data/Application",
+                                 @"/var/mobile/Containers/Shared/AppGroup"]) {
+            for (NSString *sub in [fm contentsOfDirectoryAtPath:root error:nil]) {
+                NSString *base = [root stringByAppendingPathComponent:sub];
+                NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:
+                    [base stringByAppendingPathComponent:
+                     @".com.apple.mobile_container_manager.metadata.plist"]];
+                NSString *ident = m[@"MCMMetadataIdentifier"];
+                if (![ident isKindOfClass:[NSString class]]) continue;
+                NSString *low = [ident lowercaseString];
+                if (![low containsString:@"wetype"] && ![low containsString:@"tencent"] &&
+                    ![low containsString:@"wxkb"] && ![low containsString:@"xin.keyboard"] &&
+                    ![low containsString:@"wechat"]) continue;
+                [bases addObject:base];
+            }
+        }
+        if (bases.count == 0) return @"没找到任何微信输入法相关容器";
+
+        int ok = 0;
+        for (NSString *base in bases) {
+            for (NSString *rel in @[@"Documents/WeTypeEnhance/config.plist",
+                                    @"Library/Preferences/com.colorblack.wetypeenhance.plist"]) {
+                NSString *dest = [base stringByAppendingPathComponent:rel];
+                NSString *d = [dest stringByDeletingLastPathComponent];
+                if (![fm fileExistsAtPath:d]) {
+                    [fm createDirectoryAtPath:d withIntermediateDirectories:YES
+                                      attributes:nil error:nil];
+                }
+                if ([src writeToFile:dest atomically:YES]) ok++;
+            }
+        }
+        NSString *sum = [NSString stringWithFormat:
+            @"已把配置铺到 %d 处 / %lu 个容器", ok, (unsigned long)bases.count];
+        NSLog(@"[WeTypeEnhance][relay] %@", sum);
+        return sum;
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"中继异常: %@", e];
+    }
+}
+
+static void WTE_RelayNotifyCallback(CFNotificationCenterRef center, void *observer,
+                                    CFStringRef name, const void *object,
+                                    CFDictionaryRef userInfo) {
+    WTE_RelayPushConfig();
+}
+
 #pragma mark - ========== 初始化 ==========
 
 __attribute__((constructor))
@@ -978,6 +1055,18 @@ static void WTE_Init(void) {
             [msg appendFormat:@"Workspace 枚举失败: %@\n", e];
         }
 
+        // —— 偏好中继：全局偏好 → 微信输入法所有相关容器 ——
+        // SpringBoard 无沙盒限制，是「面板写不进键盘容器」时的保底通道。
+        [msg appendFormat:@"\n===== 偏好中继 =====\n%@\n", WTE_RelayPushConfig() ?: @"(无返回)"];
+
+        // 之后每次面板改设置都会发 Darwin 通知，SpringBoard 收到就重新铺一遍
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        WTE_RelayNotifyCallback,
+                                        (__bridge CFStringRef)kPrefChangedNotify,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+
         BOOL ok1 = [msg writeToFile:[dir stringByAppendingPathComponent:@"springboard.txt"]
                          atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSString *ownDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WeTypeEnhance"];
@@ -1014,7 +1103,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.7.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.7.1 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

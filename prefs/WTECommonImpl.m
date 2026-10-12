@@ -139,12 +139,14 @@ NSArray *WTE_SyncConfigToReadablePlaces(void) {
         [targets addObject:[base stringByAppendingPathComponent:@"Documents/WeTypeEnhance/config.plist"]];
         [targets addObject:[base stringByAppendingPathComponent:@"Documents/wte_config.plist"]];
         [targets addObject:[base stringByAppendingPathComponent:@"Library/Application Support/WeTypeEnhance/config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"Library/Preferences/com.colorblack.wetypeenhance.plist"]];
         [targets addObject:[base stringByAppendingPathComponent:@"tmp/WeTypeEnhance/config.plist"]];
     }
     // ② 主 App 容器
     for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Data/Application", kws)) {
         [targets addObject:[base stringByAppendingPathComponent:@"Documents/WeTypeEnhance/config.plist"]];
         [targets addObject:[base stringByAppendingPathComponent:@"Library/Application Support/WeTypeEnhance/config.plist"]];
+        [targets addObject:[base stringByAppendingPathComponent:@"Library/Preferences/com.colorblack.wetypeenhance.plist"]];
     }
     // ③ App Group 共享容器
     for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Shared/AppGroup", kws)) {
