@@ -56,6 +56,11 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (void)reloadSpecifier:(PSSpecifier *)spec;
 @end
 
+// 自声明里没有 _specifiers ivar，用自定义存储承接
+@interface WTERootListController ()
+@property (nonatomic, strong) NSArray *wteSpecifiers;
+@end
+
 #pragma mark - 自定义取色单元格
 
 @interface WTEColorCell : PSTableCell
@@ -108,10 +113,10 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 @implementation WTERootListController
 
 - (NSArray *)specifiers {
-    if (!_specifiers) {
-        _specifiers = [[self buildSpecifiers] copy];
+    if (!self.wteSpecifiers) {
+        self.wteSpecifiers = [[self buildSpecifiers] copy];
     }
-    return _specifiers;
+    return self.wteSpecifiers;
 }
 
 - (PSSpecifier *)group:(NSString *)name {
@@ -277,6 +282,12 @@ typedef NS_ENUM(NSInteger, PSCellType) {
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self reloadSpecifiers];
+}
+
+// 重建 specifier 缓存后再交给父类刷新
+- (void)reloadSpecifiers {
+    self.wteSpecifiers = nil;
+    [super reloadSpecifiers];
 }
 
 #pragma mark - 取色器
