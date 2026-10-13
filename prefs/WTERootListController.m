@@ -821,7 +821,8 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
     NSString *content = path
         ? ([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"")
         : @"";
-    NSArray *l1 = @[@"占比", @"判决", @"⇒"];                       // 透明自检
+    NSArray *l1 = @[@"占比", @"判决", @"⇒", @"灰底在这一支",
+                    @"祖先逐个渲染", @"宿主键盘窗口树", @"[host-clear]"];   // 透明自检 + 灰底定位
     NSArray *l2 = @[@"注入成功", @"[host", @"宿主回执"];             // 宿主侧
     NSArray *l3 = @[@"当前配置", @"透明:", @"装饰层：摘掉", @"藏掉", @"[allwin]",
                     @"已成功写入", @"最终采用的来源"];
@@ -842,10 +843,11 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
         if (hit) continue;
         for (NSString *k in l3) if ([t containsString:k]) { [p3 addObject:t]; break; }
     }
-    // 每类只留最后几条（= 最近一次运行）
-    NSArray *s1 = p1.count > 8 ? [p1 subarrayWithRange:NSMakeRange(p1.count - 8, 8)] : p1;
-    NSArray *s2 = p2.count > 6 ? [p2 subarrayWithRange:NSMakeRange(p2.count - 6, 6)] : p2;
-    NSArray *s3 = p3.count > 5 ? [p3 subarrayWithRange:NSMakeRange(p3.count - 5, 5)] : p3;
+    // 每类只留最后几条（= 最近一次运行）。v1.9.3 加了「祖先逐个渲染」，
+    // 祖先最多 12 个 + 结论，8 行不够看，放宽到 34。
+    NSArray *s1 = p1.count > 34 ? [p1 subarrayWithRange:NSMakeRange(p1.count - 34, 34)] : p1;
+    NSArray *s2 = p2.count > 10 ? [p2 subarrayWithRange:NSMakeRange(p2.count - 10, 10)] : p2;
+    NSArray *s3 = p3.count > 8 ? [p3 subarrayWithRange:NSMakeRange(p3.count - 8, 8)] : p3;
 
     NSMutableString *msg = [NSMutableString string];
     [msg appendString:@"── 透明自检（关键）──\n"];

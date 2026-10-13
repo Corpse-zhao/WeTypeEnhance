@@ -525,7 +525,15 @@ static void WTE_DumpAllWindows(NSMutableString *out) {
 //      · ≈0%  ⇒ 本进程窗口除了键盘内容什么都没画 ⇒ 底色 100% 在宿主 App 进程
 //      · >0%  ⇒ 本进程窗口里还有别的东西在画底色 ⇒ 看窗口列表 + 普查去抓它
 // （hidden 的改动在同一个 RunLoop 里恢复，不会真的闪一帧）
+static double WTE_RenderOpaqueRatioEx(UIView *v, BOOL afterUpdates);
+
 static double WTE_RenderOpaqueRatio(UIView *v) {
+    return WTE_RenderOpaqueRatioEx(v, NO);
+}
+
+// afterUpdates=YES 时用 afterScreenUpdates:YES，强制重拍快照 ——
+// 藏掉某个子视图之后必须用它，否则拿到的是上一次的缓存（测试等于白做）。
+static double WTE_RenderOpaqueRatioEx(UIView *v, BOOL afterUpdates) {
     if (!v) return -1;
     CGSize size = v.bounds.size;
     if (size.width < 8 || size.height < 8) return -1;
@@ -540,7 +548,7 @@ static double WTE_RenderOpaqueRatio(UIView *v) {
     CGContextScaleCTM(c, (CGFloat)W / size.width, (CGFloat)H / size.height);
     @try {
         [v drawViewHierarchyInRect:CGRectMake(0, 0, size.width, size.height)
-                afterScreenUpdates:NO];
+                afterScreenUpdates:afterUpdates];
     } @catch (__unused NSException *e) { CGContextRelease(c); free(buf); return -1; }
     CGContextRelease(c);
     long opaque = 0, total = W * H;
@@ -555,6 +563,56 @@ static double WTE_RenderOpaqueRatio(UIView *v) {
 // 于是无论实际透不透明都会打印「底色 100% 来自宿主 App」—— 这是个假判决。
 // 现在先单独渲染 kb 自己（有按键、必然有像素）；若连它都是 0%，就直接宣布本项作废，
 // 不再输出任何结论，避免把排查方向带偏。
+// —— v1.9.3：祖先逐个渲染，定位「灰底到底是谁画的」——
+//
+// 背景：kb.window（_UIHostedWindow）是远程视图，本进程对它渲染拿不到位图（v1.9.0
+// 的假判决就是这么来的）。但**祖先视图是普通 UIView**，drawViewHierarchyInRect
+// 对它们有效。做法：对每个祖先 A 测两个数：
+//   ① 正常渲染 A           → 必然高（键盘内容在里面）
+//   ② 藏掉键盘容器再渲染 A  → 剩下的就是 A 自己 / A 的其它子树画的
+// ② 若 > 2%，A 这一支就在画灰底 —— 元凶直接点名，下一版照单打掉。
+// 若所有祖先 ② 都是 0% ⇒ 灰底【不在本进程】，100% 在宿主 App。
+static void WTE_DiagAncestorRender(UIView *kb, NSMutableString *out) {
+    if (!kb || !out) return;
+    [out appendString:@"\n===== 祖先逐个渲染（定位灰底是谁画的）=====\n"];
+    UIView *p = kb.superview;
+    int i = 0;
+    BOOL wasHidden = kb.hidden;
+    BOOL anyPaint = NO, anyFail = NO;
+    while (p && i < 12) {
+        double rAll = WTE_RenderOpaqueRatioEx(p, YES);
+        kb.hidden = YES;
+        double rBg  = WTE_RenderOpaqueRatioEx(p, YES);
+        NSString *cls = NSStringFromClass([p class]);
+        if (rAll < 0 || rBg < 0) {
+            anyFail = YES;
+            [out appendFormat:@"  [%d] %@ f(%.0f,%.0f,%.0f,%.0f) 渲染失败\n",
+                i, cls, p.frame.origin.x, p.frame.origin.y,
+                p.frame.size.width, p.frame.size.height];
+        } else {
+            if (rBg > 0.02) anyPaint = YES;
+            [out appendFormat:@"  [%d] %@ f(%.0f,%.0f,%.0f,%.0f) 全渲染=%5.1f%% 藏键盘后=%5.1f%% %@\n",
+                i, cls, p.frame.origin.x, p.frame.origin.y,
+                p.frame.size.width, p.frame.size.height,
+                rAll * 100, rBg * 100,
+                (rBg > 0.02 ? @"←★ 灰底在这一支" : @"")];
+        }
+        BOOL isWin = [p isKindOfClass:[UIWindow class]];
+        p = p.superview;
+        i++;
+        if (isWin) break;
+    }
+    kb.hidden = wasHidden;
+    if (anyFail) {
+        [out appendString:@"  ⚠️ 有渲染失败的 —— 本机对扩展进程的视图采样不可靠，\n"
+                          "     上面这些数字只能作参考，别当判决。\n"];
+    }
+    if (!anyPaint && !anyFail) {
+        [out appendString:@"  ⇒ 所有祖先【藏掉键盘后都是 0%】—— 灰底不在键盘扩展进程，\n"
+                          "     100% 来自宿主 App（看面板「透明诊断」里的宿主回执）。\n"];
+    }
+}
+
 static void WTE_TransparentSelfTest(UIView *kb, NSMutableString *out) {
     if (!kb || !kb.window || !out) return;
     UIWindow *w = kb.window;
@@ -1046,6 +1104,12 @@ static void WTE_ClearLayerPaint(UIView *v) {
     if (!v) return;
     WTE_SetClearBackground(v);
     if (v.isOpaque) v.opaque = NO;
+
+    // v1.9.3：有人会绕过 UIView 直接改 layer.backgroundColor，
+    // 这时候 v.backgroundColor 读到的还是旧值，清了也白清。这里直接兜一层。
+    if (v.layer.backgroundColor) {
+        v.layer.backgroundColor = NULL;
+    }
 
     if ([v isKindOfClass:[UIImageView class]]) {
         UIImageView *iv = (UIImageView *)v;
@@ -2029,6 +2093,7 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                                     @"\n===== 键盘视图树快照（前 3 层）=====\n"];
                                 WTE_DumpTree(kb, 0, dump);
                                 WTE_DumpAncestors(kb, dump);
+                                WTE_DiagAncestorRender(kb, dump);
                                 WTE_DumpPaintCensus(kb, dump);
                                 [dump appendString:
                                     @"\n===== 宿主 App 回执（宿主侧清理有没有铺开）=====\n"];
@@ -2539,15 +2604,70 @@ static int WTE_HostSweepTree(UIView *root, NSMutableString *log, int *logged) {
     return cleared;
 }
 
+// ═══ v1.9.3：宿主侧「可见回执」═══
+//
+// 之前宿主侧到底有没有被注入、有没有清到东西，只能靠翻文件 —— 用户看不见，
+// 每一轮都得等他导报告。现在直接在屏幕右上角闪一条 2 秒的小横幅：
+//   WTE宿主✓ 清N      = 注入成功，且清掉了 N 个视图
+//   WTE宿主⚠ 找到0清  = 注入成功，找到了键盘窗口但一个都没清到
+//   WTE宿主? 无窗口   = 注入成功，但这一轮没找到键盘窗口（多半是时机太早）
+//   WTE宿主✗ 原生     = 找到了但被判成原生键盘而整支跳过
+//   （屏幕上【什么都没闪】= 宿主 App 压根没被注入 → 过滤规则问题，不是代码问题）
+// 这样用户截一张图就能把宿主侧的状态说清楚，不用再发文件。
+//
+// 实现注意（v1.6.0 的教训：绝不在布局期往别人的视图树里插东西）：
+// 用一个【独立的 UIWindow】当 HUD，不碰任何现有视图；3 秒内最多闪一次。
+static UIWindow *gWTEHUDWindow = nil;
+static NSTimeInterval gWTELastHUDAt = 0;
+
+static void WTE_HostFlashHUD(NSString *text) {
+    if (!text.length) return;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - gWTELastHUDAt < 3.0) return;      // 节流，别一直闪
+    gWTELastHUDAt = now;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ WTE_HostFlashHUD(text); });
+        return;
+    }
+    @try {
+        CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+        CGRect fr = CGRectMake(sw - 190.0 - 10.0, 58.0, 190.0, 26.0);
+        if (!gWTEHUDWindow) {
+            gWTEHUDWindow = [[UIWindow alloc] initWithFrame:fr];
+            gWTEHUDWindow.windowLevel = 1000000.0;   // 盖在键盘上面，保证看得见
+            gWTEHUDWindow.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.88];
+            gWTEHUDWindow.layer.cornerRadius = 7.0;
+            gWTEHUDWindow.layer.masksToBounds = YES;
+            gWTEHUDWindow.userInteractionEnabled = NO;
+            UILabel *lb = [[UILabel alloc] initWithFrame:gWTEHUDWindow.bounds];
+            lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            lb.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
+            lb.textColor = UIColor.whiteColor;
+            lb.textAlignment = NSTextAlignmentCenter;
+            lb.tag = 7712;
+            [gWTEHUDWindow addSubview:lb];
+        }
+        gWTEHUDWindow.frame = fr;
+        UILabel *lb = (UILabel *)[gWTEHUDWindow viewWithTag:7712];
+        lb.text = text;
+        gWTEHUDWindow.hidden = NO;
+        gWTEHUDWindow.alpha = 1.0;
+        [UIView animateWithDuration:0.35
+                              delay:1.7
+                            options:UIViewAnimationOptionCurveEaseIn
+                         animations:^{ gWTEHUDWindow.alpha = 0.0; }
+                         completion:^(__unused BOOL fin) { gWTEHUDWindow.hidden = YES; }];
+    } @catch (__unused NSException *e) {}
+}
+
 // 一次宿主侧清扫：遍历所有窗口，只动「键盘窗口」那一支。
 // writeLog = YES 时把结果写进本 App 容器里的 host.txt（回执）。
 static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
     @try {
         NSArray<UIWindow *> *wins = WTE_HostAllWindows();
-        if (!wins.count) return;
 
         NSMutableString *log = [NSMutableString string];
-        int logged = 0, touched = 0, total = 0;
+        int logged = 0, touched = 0, total = 0, nativeSkipped = 0;
 
         for (UIWindow *w in wins) {
             // 判据一：窗口树里能找到「输入集宿主视图」—— 最精确
@@ -2562,6 +2682,7 @@ static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
             }
             if (!isKbWin) continue;                            // 不是键盘窗口 → 跳过
             if (WTE_HostTreeLooksLikeSystemKeyboard(w)) {       // 原生键盘 → 一根手指都不碰
+                nativeSkipped++;
                 if (writeLog) [log appendFormat:@"  [skip] %@：识别为原生键盘\n",
                                                 NSStringFromClass([w class])];
                 continue;
@@ -2576,11 +2697,21 @@ static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
             if (writeLog) WTE_HostDumpWindowTree(w, log, 40);   // 清完之后再拍一小段，对照
         }
 
+        // v1.9.3：屏幕上闪一条可见回执（不管清没清到，让用户立刻知道宿主侧的状态）
+        if (nativeSkipped > 0 && touched == 0) {
+            WTE_HostFlashHUD(@"WTE宿主✗ 原生键盘");
+        } else if (touched > 0) {
+            WTE_HostFlashHUD([NSString stringWithFormat:@"WTE宿主✓ 清%d", total]);
+        } else if (wins.count > 0) {
+            WTE_HostFlashHUD(@"WTE宿主? 无键盘窗口");
+        }
+
         if (writeLog && touched > 0) {
             NSMutableString *head = [NSMutableString stringWithFormat:
-                @"[host] bundle=%@ pid=%d 键盘窗口=%d 清掉视图=%d time=%@\n",
+                @"[host] bundle=%@ pid=%d 键盘窗口=%d 清掉视图=%d 原生跳过=%d 总窗口=%lu time=%@\n",
                 [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-                getpid(), touched, total, [NSDate date]];
+                getpid(), touched, total, nativeSkipped, (unsigned long)wins.count,
+                [NSDate date]];
             [head appendString:log];
             WTE_HostAppendReport(head);
         }
@@ -2872,7 +3003,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.9.2 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.9.3 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

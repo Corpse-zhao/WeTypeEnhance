@@ -1,50 +1,49 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  过滤规则直接照抄同目录下已验证可用的「微信输入法-毛玻璃效果 1.2.6」：
-      Bundles = com.tencent.wetype.keyboard / com.tencent.xin.keyboard / com.tencent.wetype
-      Executables = wxkb_plugin / wxkb_plugin.appex
-  该组合在微信输入法 3.5.0 上实测可注入键盘扩展。
+  v1.9.3：把过滤规则退回「只用 Bundles」这一种最稳的写法。
+
+  为什么退回：
+  v1.9.1 加了 Mode=Any + Classes=UIInputSetHostView + Executables，本意是把宿主 App
+  覆盖面铺开。但不同注入器（ellekit / substrate）对多键组合的语义实现并不一致：
+    · Mode=Any 当【或】 → Bundles 或 Classes 或 Executables 命中即注入（我们想要的）
+    · 有的实现把多键当【与】 → 必须 Bundles **且** Classes **且** Executables 全命中
+      → 宿主 App（com.tencent.xin）没有 Executables=wxkb_plugin → **宿主永远注入失败**
+  两种语义下「只用 Bundles」结果完全一样：包名在列表里 = 注入。
+  这就消掉了「宿主侧到底有没有被注入」这个最大的未知数。
+
+  注意：键盘扩展 + SpringBoard + 宿主 App 全部写在 Bundles 里，
+  缺一个 = 那个进程里什么都不做。
 -->
 <plist version="1.0">
 <dict>
     <key>Filter</key>
     <dict>
-        <!-- v1.9.1：把宿主 App 覆盖面一次性铺开。
-             第三方键盘真正的显示位置在宿主 App 进程里：
-                 UIRemoteKeyboardWindow → UIInputSetContainerView → UIInputSetHostView
-             系统在那几级容器上垫的键盘底板，扩展进程无论怎么清都碰不到。
-
-             Classes = UIInputSetHostView：这是「会弹键盘的宿主」的精确特征。
-             关键点：它是 UIKitCore 里的一个**类**，任何链接了 UIKit 的进程
-             （包括键盘扩展自己）都注册了它 —— 过滤器判的是「类存在」不是「实例存在」。
-             所以：
-               · 若 Mode 默认/显式是 Any（或）→ Bundles 命中 或 Classes 命中即注入，
-                 等于「所有能弹键盘的 App」都注入，不用穷举包名；
-               · 就算某个实现把 Mode 当 All（与）→ 交集恰好还是 Bundles 那一批，
-                 行为与 v1.8.8 完全一致，**不会变得更差**。
-             两种语义下键盘扩展本身都一定被注入，安全。 -->
-        <key>Mode</key>
-        <string>Any</string>
         <key>Bundles</key>
         <array>
-            <!-- 键盘扩展本体：主体逻辑在这里 -->
+            <!-- ===== 键盘扩展本体（主体逻辑在这里）===== -->
             <string>com.tencent.wetype.keyboard</string>
             <string>com.tencent.xin.keyboard</string>
             <string>com.tencent.wetype</string>
-            <!-- 阳性对照 + 偏好中继 -->
+
+            <!-- ===== 阳性对照 + 偏好中继 ===== -->
             <string>com.apple.springboard</string>
-            <!-- 宿主 App：键盘窗口就在这些进程里，透明底必须靠它们 -->
+
+            <!-- ===== 宿主 App：键盘真正显示的位置在这里，透明底必须靠它们 =====
+                 （透明底灰底是宿主那一级 UIInputSetHostView / backdrop 垫的，
+                   键盘扩展进程无论怎么清都碰不到） -->
             <string>com.tencent.xin</string>
             <string>com.tencent.wework</string>
             <string>com.tencent.mqq</string>
             <string>com.tencent.mobileqq</string>
+            <string>com.tencent.qq</string>
             <string>com.apple.mobilesafari</string>
             <string>com.apple.Preferences</string>
             <string>com.apple.mobilenotes</string>
             <string>com.apple.MobileSMS</string>
             <string>com.apple.mobilemail</string>
             <string>com.apple.mobilecal</string>
+            <string>com.apple.AppStore</string>
             <string>com.alipay.iphoneclient</string>
             <string>com.taobao.taobao4iphone</string>
             <string>com.taobao.taobao</string>
@@ -52,15 +51,16 @@
             <string>com.xingin.discover</string>
             <string>com.sina.weibo</string>
             <string>com.google.chrome.ios</string>
-        </array>
-        <key>Classes</key>
-        <array>
-            <string>UIInputSetHostView</string>
-        </array>
-        <key>Executables</key>
-        <array>
-            <string>wxkb_plugin</string>
-            <string>wxkb_plugin.appex</string>
+            <string>com.apple.mobileslideshow</string>
+            <string>com.apple.health</string>
+            <string>com.apple.weather</string>
+            <string>com.apple.stocks</string>
+            <string>com.apple.reminders</string>
+            <string>com.apple.facetime</string>
+            <string>com.apple.Photos</string>
+            <string>com.apple.Files</string>
+            <string>com.apple.DocumentsApp</string>
+            <string>com.apple.Tips</string>
         </array>
     </dict>
 </dict>
