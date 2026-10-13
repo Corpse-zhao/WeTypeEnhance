@@ -5,7 +5,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <PhotosUI/PhotosUI.h>
 #import "../WeTypeEnhanceCommon.h"
 
 // ---- Preferences 私有框架自声明 ----
@@ -180,7 +179,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 
 #pragma mark - 主控制器
 
-@interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate, PHPickerViewControllerDelegate>
+@interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate>
 @property (nonatomic, strong) PSSpecifier *pendingSpec;
 @end
 
@@ -304,16 +303,14 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
         @"微信输入法增强 v%@\n功能对等移植自「原生输入法增强」", ver]]];
     [specs addObject:[self switchRow:@"启用" key:kKeyEnabled def:YES]];
 
-    // ---- 1. 键盘背景 ----
+    // ---- 1. 键盘背景（v1.8.0：只保留 纯色 / 透明底） ----
     [specs addObject:[self group:@"键盘背景"]];
     [specs addObject:[self switchRow:@"开启背景" key:kKeyBgEnabled def:NO]];
     [specs addObject:[self choiceRow:@"背景模式" key:kKeyBgMode def:@"solid"
-                              values:@[@"solid", @"image", @"transparent"]
-                              titles:@[@"纯色", @"图片", @"整键盘透明"]]];
+                              values:@[@"solid", @"transparent"]
+                              titles:@[@"纯色", @"透明底"]]];
     [specs addObject:[self colorRow:@"背景颜色" key:kKeyBgColor def:@"#101826"]];
     [specs addObject:[self sliderRow:@"背景不透明度" key:kKeyBgAlpha def:1.0 min:0.0 max:1.0]];
-    [specs addObject:[self buttonRow:@"从相册选择背景图" action:@selector(pickBackgroundImage:)]];
-    [specs addObject:[self switchRow:@"整键盘透明" key:kKeyKeyboardTransparent def:NO]];
 
     // ---- 2. 按键配色 ----
     [specs addObject:[self group:@"按键配色"]];
@@ -598,106 +595,6 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     WTE_NotifyChanged();
     self.pendingSpec = nil;
     [self reloadSpecifiers];
-}
-
-#pragma mark - 相册选图
-
-- (void)pickBackgroundImage:(PSSpecifier *)spec {
-    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
-    cfg.filter = [PHPickerFilter imagesFilter];
-    cfg.selectionLimit = 1;
-    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
-    picker.delegate = self;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-
-- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-    if (results.count == 0) return;
-
-    NSItemProvider *itemProvider = results.firstObject.itemProvider;
-    if (![itemProvider canLoadObjectOfClass:[UIImage class]]) return;
-
-    __weak typeof(self) weakSelf = self;
-    [itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
-        if (![object isKindOfClass:[UIImage class]]) return;
-        UIImage *image = (UIImage *)object;
-        // 裁切成键盘比例，控制文件体积
-        UIImage *cropped = [weakSelf cropToKeyboardAspect:image];
-        NSData *png = UIImagePNGRepresentation(cropped);
-        if (!png) return;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSArray *paths = @[
-                @"/var/mobile/Library/Application Support/WeTypeEnhance",
-                @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance",
-            ];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            for (NSString *dir in paths) {
-                NSError *e = nil;
-                if (![fm fileExistsAtPath:dir]) {
-                    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&e];
-                }
-                if ([fm fileExistsAtPath:dir]) {
-                    NSString *dest = [dir stringByAppendingPathComponent:@"bg.png"];
-                    [png writeToFile:dest atomically:YES];
-                }
-            }
-            WTE_SetPref(kKeyBgMode, @"image");
-            WTE_SetPref(kKeyBgEnabled, @YES);
-            WTE_SyncConfigToReadablePlaces();   // 连同 bg.png 一起铺进键盘容器
-            WTE_NotifyChanged();
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf reloadSpecifiers];
-                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已设置"
-                                                                          message:@"背景图已裁成键盘比例并写入键盘（需注销一次生效）"
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                [weakSelf presentViewController:a animated:YES completion:nil];
-            });
-        });
-    }];
-}
-
-- (UIImage *)cropToKeyboardAspect:(UIImage *)image {
-    CGSize sz = image.size;
-    if (sz.width <= 0 || sz.height <= 0) return image;
-    // 键盘可视区域 ≈ 屏宽 × (屏高 * 0.30)。按当前设备动态算比例，
-    // 再夹到 1.2 ~ 2.0，避免极端机型出怪比例。
-    CGSize scr = [UIScreen mainScreen].bounds.size;
-    CGFloat kbH = scr.height * 0.30;
-    CGFloat targetRatio = (kbH > 0) ? (scr.width / kbH) : 1.5;
-    targetRatio = MIN(2.0, MAX(1.2, targetRatio));
-
-    CGFloat curRatio = sz.width / sz.height;
-    CGRect rect;
-    if (curRatio > targetRatio) {
-        CGFloat w = sz.height * targetRatio;
-        rect = CGRectMake((sz.width - w) / 2.0, 0, w, sz.height);
-    } else {
-        CGFloat h = sz.width / targetRatio;
-        rect = CGRectMake(0, (sz.height - h) / 2.0, sz.width, h);
-    }
-    CGFloat scale = image.scale;
-    CGRect px = CGRectMake(rect.origin.x * scale, rect.origin.y * scale,
-                           rect.size.width * scale, rect.size.height * scale);
-    CGImageRef cg = CGImageCreateWithImageInRect(image.CGImage, px);
-    if (!cg) return image;
-    UIImage *out = [UIImage imageWithCGImage:cg scale:scale orientation:image.imageOrientation];
-    CGImageRelease(cg);
-
-    // 限宽 1400px，避免相册原图把 plist/容器塞爆
-    CGFloat maxW = 1400.0;
-    if (out.size.width > maxW) {
-        CGFloat newH = out.size.height * (maxW / out.size.width);
-        UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
-        f.scale = 1.0;
-        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
-                                      initWithSize:CGSizeMake(maxW, newH) format:f];
-        out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            [out drawInRect:CGRectMake(0, 0, maxW, newH)];
-        }];
-    }
-    return out;
 }
 
 #pragma mark - 预设

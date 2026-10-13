@@ -277,7 +277,6 @@ static void WTE_DiagFlush(NSString *tag) {}
 @property (nonatomic, copy)   NSString *bgMode;
 @property (nonatomic, strong) UIColor  *bgColor;
 @property (nonatomic, assign) double    bgAlpha;
-@property (nonatomic, strong) UIImage  *bgImage;
 @property (nonatomic, assign) BOOL keyboardTransparent;
 
 @property (nonatomic, assign) BOOL keyColorEnabled;
@@ -347,27 +346,11 @@ static void WTE_DiagFlush(NSString *tag) {}
 
     c.bgEnabled           = WTE_BoolPref(kKeyBgEnabled, NO);
     c.bgMode              = WTE_StringPref(kKeyBgMode, @"solid");
+    if (![c.bgMode isEqualToString:@"transparent"]) c.bgMode = @"solid";  // 只保留 纯色 / 透明底
     c.bgColor             = WTE_ColorFromHex(WTE_StringPref(kKeyBgColor, @"#1C1C1E")) ?: [UIColor clearColor];
     c.bgAlpha             = WTE_DoublePref(kKeyBgAlpha, 1.0);
-    c.keyboardTransparent = WTE_BoolPref(kKeyKeyboardTransparent, NO);
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *useImg = nil;
-    // 优先键盘扩展自己容器里的（面板/中继铺进来的，唯一确定读得到的通道）
-    for (NSString *p in @[[NSString stringWithFormat:@"%@/Documents/WeTypeEnhance/bg.png", NSHomeDirectory()],
-                          [NSString stringWithFormat:@"%@/tmp/WeTypeEnhance/bg.png", NSHomeDirectory()],
-                          @"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png",
-                          @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/bg.png"]) {
-        if (p.length && [fm fileExistsAtPath:p]) { useImg = p; break; }
-    }
-    if (useImg) {
-        c.bgImage = [UIImage imageWithContentsOfFile:useImg];
-    } else {
-        id data = WTE_GetPref(kKeyBgImageData);
-        if ([data isKindOfClass:[NSData class]] && [(NSData *)data length] > 0) {
-            c.bgImage = [UIImage imageWithData:data];
-        }
-    }
+    // 「整键盘透明」并入背景模式：mode=transparent 即透明底
+    c.keyboardTransparent = [c.bgMode isEqualToString:@"transparent"];
 
     c.keyColorEnabled   = WTE_BoolPref(kKeyKeyColorEnabled, NO);
     c.keyLetterBg       = WTE_ColorFromHex(WTE_StringPref(kKeyKeyLetterBg, @"#FFFFFF"));
@@ -585,36 +568,44 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
 
 #pragma mark - ========== 核心：把配置应用到单个视图 ==========
 
+// 只在颜色真的变了才写。冗余写 backgroundColor 会触发重绘/重排，
+// 在 -layoutSubviews 里反复写就是「卡死」的温床。
+static void WTE_SetBackground(UIView *v, UIColor *col) {
+    if (!v || !col) return;
+    UIColor *cur = v.backgroundColor;
+    if (cur == col) return;
+    CGColorRef a = cur.CGColor, b = col.CGColor;
+    if (a && b && CGColorEqualToColor(a, b)) return;
+    v.backgroundColor = col;
+}
+
+static void WTE_SetClearBackground(UIView *v) {
+    if (!v) return;
+    UIColor *bg = v.backgroundColor;
+    if (!bg) return;
+    CGColorRef cg = bg.CGColor;
+    if (cg && CGColorGetAlpha(cg) <= 0.001) return;   // 已经透明，别碰
+    v.backgroundColor = [UIColor clearColor];
+}
+
 static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
-    BOOL transparent = c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"];
-    BOOL imageBg     = c.bgEnabled && [c.bgMode isEqualToString:@"image"] && c.bgImage;
-    BOOL solidBg     = c.bgEnabled && !transparent && !imageBg;
+    BOOL transparent = (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]);
+    BOOL solidBg     = (c.bgEnabled && !transparent);
 
-    // v1.7.0：不再往键盘视图里 insertSubview。
-    // 之前是在 -layoutSubviews 内部插一个背景子视图，等于在布局途中改视图树，
-    // UIKit 会异常/死循环 → 整个输入法崩溃。
-    // 现在全部走图层：背景色用 backgroundColor，背景图用 layer.contents，零视图树改动。
+    // v1.8.0：图片模式已移除，只保留「纯色 / 透明底」。
+    // 背景一律走 backgroundColor（+ 清中间层），零视图树改动、零 Layer 内容切换。
     CALayer *layer = self.layer;
+    if (layer.contents) layer.contents = nil;   // 清掉旧版本可能残留的背景图
 
-    if (imageBg) {
-        layer.contents = (__bridge id)c.bgImage.CGImage;
-        layer.contentsGravity = kCAGravityResizeAspectFill;
-        layer.contentsScale = c.bgImage.scale > 0 ? c.bgImage.scale : [UIScreen mainScreen].scale;
-        layer.masksToBounds = YES;
-        ((UIView *)self).backgroundColor = [UIColor clearColor];
-        self.opaque = NO;
-    } else {
-        if (layer.contents) layer.contents = nil;
-        if (solidBg) {
-            self.backgroundColor = [c.bgColor colorWithAlphaComponent:c.bgAlpha];
-        } else if (transparent) {
-            self.backgroundColor = [UIColor clearColor];
-            self.opaque = NO;
-            if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
-                @try {
-                    ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
-                } @catch (__unused NSException *e) {}
-            }
+    if (solidBg) {
+        WTE_SetBackground(self, [c.bgColor colorWithAlphaComponent:c.bgAlpha]);
+    } else if (transparent) {
+        WTE_SetClearBackground(self);
+        if (self.opaque) self.opaque = NO;
+        if ([self respondsToSelector:NSSelectorFromString(@"setBackgroundEffects:")]) {
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
+            } @catch (__unused NSException *e) {}
         }
     }
 
@@ -660,17 +651,17 @@ static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
         self.layer.shadowOpacity = 0.0;
     }
 
-    // 底色
+    // 按键底色
     if (c.keyColorEnabled) {
         UIColor *col = WTE_ColorForKeyKind(kind, c);
         if (col) {
-            self.backgroundColor = col;
+            WTE_SetBackground(self, col);
             // 有些按键底色画在子视图上，一并处理一层
             for (UIView *sub in self.subviews) {
                 if (![sub isKindOfClass:[UILabel class]] && sub.subviews.count == 0 &&
                     sub.bounds.size.height >= self.bounds.size.height * 0.8 &&
                     sub.bounds.size.width  >= self.bounds.size.width  * 0.8) {
-                    sub.backgroundColor = col;
+                    WTE_SetBackground(sub, col);
                 }
             }
         }
@@ -703,7 +694,7 @@ static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
 
 static void WTE_ApplyBarOrCandidate(UIView *self, WTEConfig *c) {
     if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
-        self.backgroundColor = [UIColor clearColor];
+        WTE_SetClearBackground(self);
     }
     if (c.keyColorEnabled && c.keyTextColor) {
         if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = c.keyTextColor;
@@ -724,13 +715,38 @@ static BOOL WTE_HasKeyboardAncestor(UIView *v) {
     return NO;
 }
 
-// 统一入口：按类名特征分派
-static void WTE_ApplyToView(UIView *self) {
+#pragma mark —— 幂等令牌：卡死防护的核心 ——
+//
+// v1.7.1/1.7.2 卡死根因：在 -layoutSubviews 里改 backgroundColor / 清 effect，
+// 会让视图重新布局 → 又进我们的 hook → 又改 → **布局反馈死循环**，CPU 打满。
+// 修法：给每个视图记一个「上次应用时的令牌」，令牌 = 配置对象指针 + 当前尺寸。
+//   · 配置没变 && 尺寸没变  → 直接跳过，一次都不碰视图 → 循环自然断开
+//   · 面板改配置 → WTE_ReloadConfig 造出新的 WTEConfig 对象 → 指针变 → 令牌变 → 重新应用
+static const void *kWTELastApplyKey = &kWTELastApplyKey;
+static const void *kWTEClearedKey   = &kWTEClearedKey;
+static const void *kWTESubtreeCfgKey = &kWTESubtreeCfgKey;
+
+static NSUInteger WTE_ApplyToken(UIView *v, WTEConfig *c) {
+    NSUInteger h = (NSUInteger)(uintptr_t)c;
+    h = h * 31u + (NSUInteger)(v.bounds.size.width + 0.5);
+    h = h * 31u + (NSUInteger)(v.bounds.size.height + 0.5);
+    return h;
+}
+
+// 统一入口：按类名特征分派。返回 YES 表示本次真的做了改动。
+static BOOL WTE_ApplyToView(UIView *self) {
     WTEConfig *c = gConfig;
-    if (!c || !c.enabled) return;
+    if (!c || !c.enabled) return NO;
 
     NSString *cls = NSStringFromClass([self class]);
-    if (cls.length == 0) return;
+    if (cls.length == 0) return NO;
+
+    // 幂等闸门：配置与尺寸都没变就不再碰这个视图
+    NSUInteger token = WTE_ApplyToken(self, c);
+    NSNumber *prev = objc_getAssociatedObject(self, kWTELastApplyKey);
+    if (prev && prev.unsignedIntegerValue == token) return NO;
+    objc_setAssociatedObject(self, kWTELastApplyKey, @(token),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     if (WTE_NameIsKeyboard(cls)) {
         if (!WTE_HasKeyboardAncestor(self)) WTE_ApplyKeyboardBg(self, c);
@@ -739,6 +755,7 @@ static void WTE_ApplyToView(UIView *self) {
     } else if (WTE_NameIsKey(cls)) {
         WTE_ApplyKeyAppearance(self, c);
     }
+    return YES;
 }
 
 #pragma mark - ========== 动态 hook（白名单 + 崩溃防护） ==========
@@ -809,6 +826,23 @@ static IMP WTE_OrigLayoutIMP(Class cls) {
 
 static void WTE_ApplySubtree(UIView *root, int depth);   // 前置声明
 
+// 类名 → 种类缓存（0=无关 1=键盘容器 2=候选/工具栏 3=按键）
+// -layoutSubviews 是热路径（键盘动画时 60fps × 几十个视图），
+// 每次都跑一串 containsString 太亏，这里按类名缓存一次。
+static NSMutableDictionary<NSString *, NSNumber *> *gKindCache;
+static int WTE_KindOfClass(NSString *cls) {
+    if (cls.length == 0) return 0;
+    NSNumber *n = gKindCache[cls];
+    if (n) return n.intValue;
+    int k = 0;
+    if (WTE_NameIsKeyboard(cls))                            k = 1;
+    else if (WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls)) k = 2;
+    else if (WTE_NameIsKey(cls))                             k = 3;
+    if (!gKindCache) gKindCache = [NSMutableDictionary new];
+    gKindCache[cls] = @(k);
+    return k;
+}
+
 static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
     // 1) 先跑原始布局（保证 bounds 已是最终值）
     IMP orig = WTE_OrigLayoutIMP([self class]);
@@ -822,10 +856,24 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
     gWTEBusy = YES;
     @try {
         NSString *cls = NSStringFromClass([self class]);
-        if (WTE_NameIsKeyboard(cls)) {
-            WTE_ApplyToView(self);        // 键盘背景（只设颜色 / layer，不插子视图）
-            WTE_ApplySubtree(self, 0);    // 子树的按键、候选栏、工具栏
-        } else {
+        int kind = WTE_KindOfClass(cls);
+        if (kind == 1) {
+            // 只在最外层键盘容器上做整树遍历（嵌套的 3 个容器只走一次，省 2/3 开销）
+            if (!WTE_HasKeyboardAncestor(self)) {
+                // 整树遍历是「配置级」动作：只有配置真的换了才走一遍。
+                // 键盘滑入滑出时 bounds 每帧都在变，但颜色没变，没必要每帧遍历 150 个视图。
+                NSUInteger cfg = (NSUInteger)(uintptr_t)c;
+                NSNumber *last = objc_getAssociatedObject(self, kWTESubtreeCfgKey);
+                if (!last || last.unsignedIntegerValue != cfg) {
+                    objc_setAssociatedObject(self, kWTESubtreeCfgKey, @(cfg),
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    WTE_ApplyToView(self);
+                    WTE_ApplySubtree(self, 0);
+                } else {
+                    WTE_ApplyToView(self);   // 配置没变、只是尺寸变了：只更新容器自己
+                }
+            }
+        } else if (kind != 0) {
             WTE_ApplyToView(self);
         }
     } @catch (__unused NSException *e) {}
@@ -846,29 +894,40 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
 // 而是中间那些不带 WB 前缀的子视图自己画的背景 / 毛玻璃层 ——
 // 不清掉它们，容器上画的背景永远被盖住（1.7.1 键盘背景完全不生效的根因）。
 static void WTE_ApplySubtree(UIView *root, int depth) {
-    if (!root || depth > 8) return;
+    if (!root || depth > 6) return;
     WTEConfig *c = gConfig;
+    if (!c) return;
     // 需要中间层「让位」：开了背景（纯色/图片）或开了整键盘透明
-    BOOL clearMiddle = c && (c.bgEnabled || c.keyboardTransparent ||
-                             [c.bgMode isEqualToString:@"transparent"]);
+    BOOL clearMiddle = (c.bgEnabled || c.keyboardTransparent ||
+                        [c.bgMode isEqualToString:@"transparent"]);
+    NSUInteger clearToken = (NSUInteger)(uintptr_t)c;   // 配置一变就重新清一次
+
     for (UIView *sub in [root.subviews copy]) {
         @try {
             NSString *cls = NSStringFromClass([sub class]);
-            BOOL isKey   = WTE_NameIsKey(cls);
-            BOOL isBar   = WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls);
-            BOOL isKB    = WTE_NameIsKeyboard(cls);
+            BOOL isKey = WTE_NameIsKey(cls);
+            BOOL isBar = WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls);
+            BOOL isKB  = WTE_NameIsKeyboard(cls);
             if (isKB || isKey || isBar) {
                 WTE_ApplyToView(sub);
             } else if (clearMiddle) {
-                // 非键盘元素的中间层：清底色 + 去毛玻璃，让容器背景透出来
-                sub.backgroundColor = [UIColor clearColor];
-                sub.opaque = NO;
-                if ([sub isKindOfClass:[UIVisualEffectView class]]) {
-                    ((UIVisualEffectView *)sub).effect = nil;
-                }
-                SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
-                if ([sub respondsToSelector:sfx]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(sub, sfx, nil);
+                // 幂等：同一个配置下只清一次，避免「清 → 重新布局 → 再清」死循环
+                NSNumber *pv = objc_getAssociatedObject(sub, kWTEClearedKey);
+                if (!pv || pv.unsignedIntegerValue != clearToken) {
+                    objc_setAssociatedObject(sub, kWTEClearedKey, @(clearToken),
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    // 非键盘元素的中间层：清底色 + 去毛玻璃，让容器背景透出来
+                    // （每一步都先判断当前值，冗余写入本身就会触发布局）
+                    WTE_SetClearBackground(sub);
+                    if (sub.isOpaque) sub.opaque = NO;
+                    if ([sub isKindOfClass:[UIVisualEffectView class]]) {
+                        UIVisualEffectView *ev = (UIVisualEffectView *)sub;
+                        if (ev.effect) ev.effect = nil;
+                    }
+                    SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
+                    if ([sub respondsToSelector:sfx]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(sub, sfx, nil);
+                    }
                 }
             }
             WTE_ApplySubtree(sub, depth + 1);
@@ -1136,7 +1195,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.7.2 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.0 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
