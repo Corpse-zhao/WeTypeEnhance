@@ -626,6 +626,12 @@ static void WTE_SetClearBackground(UIView *v) {
 // （layer.contents 或 UIImageView.image）或毛玻璃层 —— 只清颜色是没用的。
 // ⚠️ 绝不能在「按键 / 工具栏内部」调用：那里面有字母、图标，
 //    清掉 layer.contents 会把 UILabel 的文字一起抹掉。
+//
+// 关于 setBackgroundEffects:：它没有 getter，读不到当前值，
+// 而它本身会触发重新布局（写多了就是卡死）。所以用「配置令牌」标记，
+// 同一个配置下每个视图只调一次。配置一变（面板改设置）自动重新武装。
+static const void *kWTEgBgEffectsKey = &kWTEgBgEffectsKey;
+
 static void WTE_ClearLayerPaint(UIView *v) {
     if (!v) return;
     WTE_SetClearBackground(v);
@@ -643,9 +649,41 @@ static void WTE_ClearLayerPaint(UIView *v) {
         UIVisualEffectView *ev = (UIVisualEffectView *)v;
         if (ev.effect) ev.effect = nil;
     }
-    SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
-    if ([v respondsToSelector:sfx]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(v, sfx, nil);
+
+    NSUInteger token = (NSUInteger)(uintptr_t)gConfig;
+    NSNumber *prev = objc_getAssociatedObject(v, kWTEgBgEffectsKey);
+    if (!prev || prev.unsignedIntegerValue != token) {
+        objc_setAssociatedObject(v, kWTEgBgEffectsKey, @(token),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
+        if ([v respondsToSelector:sfx]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(v, sfx, nil);
+        }
+    }
+}
+
+// 透明底专属：顺着【祖先链】往上清。
+// 键盘主题背景常常并不画在我们的容器上，而是画在容器的祖先上
+// （UIInputView / 系统宿主视图 / 毛玻璃层）。
+// 证据：纯色模式能把它盖住（说明它在下层），透明底一清空就露出来了。
+// 所以必须往上清，否则永远透不出去。
+// 安全边界：只清「看起来是键盘宿主」的祖先，碰到不相干的立刻停 ——
+// 一路清到 window 会把整个 App 的界面都搞透明。
+static void WTE_ClearKeyboardAncestors(UIView *kb) {
+    UIView *p = kb ? kb.superview : nil;
+    int hops = 0;
+    while (p && hops < 5) {
+        if ([p isKindOfClass:[UIWindow class]]) break;
+        NSString *n = NSStringFromClass([p class]);
+        BOOL looksHost = ([n containsString:@"Input"] ||
+                          [n containsString:@"Keyboard"] ||
+                          [n containsString:@"Host"]);
+        BOOL isEffect  = [p isKindOfClass:[UIVisualEffectView class]];
+        BOOL isImg     = [p isKindOfClass:[UIImageView class]];
+        if (!(looksHost || isEffect || isImg)) break;   // 不相干的祖先，别碰
+        WTE_ClearLayerPaint(p);
+        p = p.superview;
+        hops++;
     }
 }
 
@@ -668,6 +706,11 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
                 ((void (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"setBackgroundEffects:"), nil);
             } @catch (__unused NSException *e) {}
         }
+        // ★ 透明底的关键：键盘主题背景往往不是画在我们容器上，
+        //   而是画在容器的【祖先】上（UIInputView / 系统宿主视图 / 毛玻璃层）。
+        //   证据：纯色模式能盖住它（说明它在下层），透明底一清空就露出来了。
+        //   所以必须顺着祖先链往上清，否则永远透不出去。
+        WTE_ClearKeyboardAncestors(self);
     }
 
     // 键盘整体位移：只在目标值变化时才写 transform，
@@ -1275,7 +1318,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.2 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.3 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
