@@ -294,6 +294,50 @@ static void WTE_DumpTree(UIView *v, int depth, NSMutableString *out) {
      v.layer.contents ? 1 : 0, v.alpha];
     for (UIView *s in v.subviews) WTE_DumpTree(s, depth + 1, out);
 }
+
+// —— 祖先链快照 ——
+// 背景类问题的另一半线索：底色可能压根不在键盘子树里，而在【祖先】或
+// 【同层兄弟】上。这里从键盘容器一路往上打到窗口（含窗口），
+// 并把每一层排在它前面的兄弟视图也列出来 —— 谁在画底色一眼可见。
+static void WTE_DumpOneLine(UIView *v, const char *tag, NSMutableString *out) {
+    if (!v) return;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    CGColorRef cg = v.backgroundColor.CGColor;
+    if (cg) {
+        const CGFloat *comp = CGColorGetComponents(cg);
+        size_t n = CGColorGetNumberOfComponents(cg);
+        if (comp) {
+            if (n >= 4) { r = comp[0]; g = comp[1]; b = comp[2]; a = comp[3]; }
+            else if (n >= 2) { r = g = b = comp[0]; a = comp[1]; }
+        }
+    }
+    [out appendFormat:@"  %s %@ f(%.0f,%.0f,%.0f,%.0f) bg(%.2f,%.2f,%.2f,%.2f) op=%d ct=%d al=%.2f z=%lu\n",
+     tag, NSStringFromClass([v class]),
+     v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
+     r, g, b, a, v.isOpaque ? 1 : 0, v.layer.contents ? 1 : 0, v.alpha,
+     (unsigned long)(v.superview ? [v.superview.subviews indexOfObject:v] : 0)];
+}
+
+static void WTE_DumpAncestors(UIView *kb, NSMutableString *out) {
+    if (!kb || !out) return;
+    [out appendString:@"\n===== 键盘祖先链 + 同层前置兄弟 =====\n"];
+    UIView *p = kb.superview;
+    UIView *child = kb;
+    int hops = 0;
+    while (p && hops < 12) {
+        WTE_DumpOneLine(p, "ANC ", out);
+        if ([p isKindOfClass:[UIWindow class]]) { [out appendString:@"  ^^ 这是窗口，祖先链到此为止\n"]; break; }
+        // 同层里排在「kb 这一支」前面（z 序更低）的兄弟
+        for (UIView *sib in p.subviews) {
+            if (sib == child) break;
+            WTE_DumpOneLine(sib, "  ├─SIB", out);
+        }
+        child = p;
+        p = p.superview;
+        hops++;
+    }
+    if (!p || hops >= 12) [out appendString:@"  (祖先链没走到窗口)\n"];
+}
 #else
 #define WTE_Diag(...) do {} while (0)
 static void WTE_DiagFlush(NSString *tag) {}
@@ -662,29 +706,135 @@ static void WTE_ClearLayerPaint(UIView *v) {
     }
 }
 
-// 透明底专属：顺着【祖先链】往上清。
-// 键盘主题背景常常并不画在我们的容器上，而是画在容器的祖先上
-// （UIInputView / 系统宿主视图 / 毛玻璃层）。
-// 证据：纯色模式能把它盖住（说明它在下层），透明底一清空就露出来了。
-// 所以必须往上清，否则永远透不出去。
-// 安全边界：只清「看起来是键盘宿主」的祖先，碰到不相干的立刻停 ——
-// 一路清到 window 会把整个 App 的界面都搞透明。
+// —— 透明底：把「键盘容器背后的所有底色」全部清掉 ——
+//
+// 背景到底画在哪，只有两个可能，两个都要处理：
+//   A. 画在我们的【祖先】上（UIInputSetHostView / UIInputSetContainerView /
+//      毛玻璃层 / 键盘窗口本身）—— 祖先永远在子视图下面，一清就透出去。
+//   B. 画在同一层里【排在我们前面（z 序更低 = 更靠后）的兄弟视图】上。
+//      v1.8.3 之前只清了祖先、没管兄弟，所以可能是 B 的情况一直没修好。
+//
+// ⚠️ 关键认识：键盘扩展运行在【自己独立的进程和窗口】里，
+//    这棵树里的东西全都是键盘自己的 —— 可以放心一路清到窗口，
+//    绝不可能把宿主 App（微信）的界面搞透明。
+//
+// ⚠️ 但「清背景」和「清内容」必须分开：字母、图标、候选词一旦被清掉，
+//    键盘就废了。所以这里用两条保守规则：
+//      · 祖先 → 只清它【自己那一层】的底色/纹理（绝不下探，不碰后代内容）
+//      · 兄弟 → 只有「整棵子树没有任何文字/图片」才敢清；
+//              例外：面积 ≥ 键盘 85% 宽 × 50% 高的图片 = 皮肤纹理图，
+//              那是背景不是图标，也要清。
+
+// 子树里有没有「真正的内容」（文字 / 图片）？没有 = 纯背景层，可以放心清。
+static BOOL WTE_SubtreeHasContent(UIView *v, int depth) {
+    if (!v || depth > 8) return YES;   // 太深就保守当它有内容，宁可漏清不可误清
+    for (UIView *s in v.subviews) {
+        if ([s isKindOfClass:[UILabel class]]) return YES;
+        if ([s isKindOfClass:[UIImageView class]] && ((UIImageView *)s).image) return YES;
+        if (WTE_SubtreeHasContent(s, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+// 连子树一起清（只在「确认无内容」或「确认是皮肤大图」时才用）
+static void WTE_ClearLayerPaintDeep(UIView *v) {
+    if (!v) return;
+    WTE_ClearLayerPaint(v);
+    for (UIView *s in [v.subviews copy]) WTE_ClearLayerPaintDeep(s);
+}
+
+// 大面积图片 = 皮肤/纹理背景（小面积图片 = 图标，不动）
+static BOOL WTE_LooksLikeSkinImage(UIView *v, CGSize kb) {
+    if (![v isKindOfClass:[UIImageView class]]) return NO;
+    if (!((UIImageView *)v).image) return NO;
+    if (kb.width <= 1.0 || kb.height <= 1.0) return NO;
+    CGSize s = v.bounds.size;
+    return (s.width >= kb.width * 0.85 && s.height >= kb.height * 0.5);
+}
+
+// 窗口级兜底清扫：把整棵窗口树里「大面积 + 无内容」的纯背景层全清掉，
+// 但【绝不进键盘容器 kb 的子树】—— 那里面是字母、图标、候选词。
+static void WTE_ClearWindowBackgrounds(UIView *kb) {
+    if (!kb) return;
+    UIWindow *w = kb.window;
+    if (!w) return;
+    CGFloat kbArea = kb.bounds.size.width * kb.bounds.size.height;
+    if (kbArea <= 1.0) return;
+
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+    int guard = 0;
+    while (stack.count > 0 && guard < 3000) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in [v.subviews copy]) {
+            if (s == kb) continue;                       // 键盘本体 → 整支跳过
+            CGFloat area = s.bounds.size.width * s.bounds.size.height;
+            BOOL big = (area >= kbArea * 0.35);
+            if (WTE_LooksLikeSkinImage(s, kb.bounds.size)) {
+                WTE_ClearLayerPaintDeep(s);
+            } else if (big && !WTE_SubtreeHasContent(s, 0)) {
+                WTE_ClearLayerPaintDeep(s);
+            } else {
+                [stack addObject:s];                     // 有内容 → 只往下找，不动它
+            }
+        }
+    }
+}
+
+static const void *kWTEAncestorKey = &kWTEAncestorKey;
+
 static void WTE_ClearKeyboardAncestors(UIView *kb) {
-    UIView *p = kb ? kb.superview : nil;
+    if (!kb) return;
+    NSUInteger token = (NSUInteger)(uintptr_t)gConfig;
+    NSMutableSet *seen = objc_getAssociatedObject(kb, kWTEAncestorKey);
+    if (seen && [seen containsObject:@(token)]) return;   // 本配置已处理过，绝不重复扫
+
+    CGSize kbSize = kb.bounds.size;
+    UIView *p = kb.superview;
+    UIView *child = kb;
     int hops = 0;
-    while (p && hops < 5) {
-        if ([p isKindOfClass:[UIWindow class]]) break;
-        NSString *n = NSStringFromClass([p class]);
-        BOOL looksHost = ([n containsString:@"Input"] ||
-                          [n containsString:@"Keyboard"] ||
-                          [n containsString:@"Host"]);
-        BOOL isEffect  = [p isKindOfClass:[UIVisualEffectView class]];
-        BOOL isImg     = [p isKindOfClass:[UIImageView class]];
-        if (!(looksHost || isEffect || isImg)) break;   // 不相干的祖先，别碰
+
+    while (p && hops < 10) {
+        // A. 祖先自己那一层：直接清（不下探，绝不碰后代里的文字/图标）
         WTE_ClearLayerPaint(p);
+
+        // B. 同层里排在「我们这一支」前面的兄弟 —— 它们也是在我们后面画的
+        for (UIView *sib in [p.subviews copy]) {
+            if (sib == child) break;          // 走到我们这一支就停
+            if (WTE_LooksLikeSkinImage(sib, kbSize)) { WTE_ClearLayerPaintDeep(sib); continue; }
+            if (WTE_SubtreeHasContent(sib, 0)) continue;   // 有文字/图标 → 不动
+            WTE_ClearLayerPaintDeep(sib);
+        }
+
+        if ([p isKindOfClass:[UIWindow class]]) {
+            UIWindow *w = (UIWindow *)p;
+            if (w.opaque) w.opaque = NO;
+            WTE_SetClearBackground(w);
+            break;
+        }
+        child = p;
         p = p.superview;
         hops++;
     }
+
+    // 万一 superview 链没走到窗口（键盘扩展里偶尔会有），用 kb.window 兜一下
+    UIWindow *win = kb.window;
+    if (win) {
+        if (win.opaque) win.opaque = NO;
+        WTE_SetClearBackground(win);
+    }
+
+    // C. 兜底大扫除：整个键盘窗口里「大面积 + 没内容」的层一律清掉。
+    //    有些皮肤的底图并不挂在键盘容器的祖先链上，而是挂在窗口根视图下面的
+    //    另一支上 —— 只扫祖先链永远找不到它。
+    //    加「面积 ≥ 键盘 35%」这道闸，是为了避开窄条形的工具栏之类。
+    //    （真正有文字/图标的视图会被 WTE_SubtreeHasContent 挡掉。）
+    WTE_ClearWindowBackgrounds(kb);
+
+    if (!seen) seen = [NSMutableSet new];
+    [seen addObject:@(token)];
+    objc_setAssociatedObject(kb, kWTEAncestorKey, seen, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
@@ -986,13 +1136,25 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                     WTE_ApplySubtree(self, 0);
 #if WTE_LOG_ENABLE
                     // 配置变了 → 拍一张视图树快照（最多 3 张，避免诊断文件膨胀）
+                    // ⚠️ 必须延后到布局结束再拍：直接在 -layoutSubviews 里拍，
+                    //    所有 frame 都是 0,0,0,0（布局还没写进去），等于白拍。
                     if (!gDiagDumpedTree) {
                         gDiagDumpedTree = YES;
-                        NSMutableString *dump = [NSMutableString stringWithString:
-                            @"\n===== 键盘视图树快照（前 3 层）=====\n"];
-                        WTE_DumpTree(self, 0, dump);
-                        WTE_Diag(@"%@", dump);
-                        WTE_DiagFlush(@"tree");
+                        __weak UIView *weakSelf = self;
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                      (int64_t)(0.8 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            UIView *kb = weakSelf;
+                            if (!kb) return;
+                            @try {
+                                NSMutableString *dump = [NSMutableString stringWithString:
+                                    @"\n===== 键盘视图树快照（前 3 层）=====\n"];
+                                WTE_DumpTree(kb, 0, dump);
+                                WTE_DumpAncestors(kb, dump);
+                                WTE_Diag(@"%@", dump);
+                                WTE_DiagFlush(@"tree");
+                            } @catch (__unused NSException *e) {}
+                        });
                     }
 #endif
                 } else {
@@ -1318,7 +1480,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.3 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.4 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
