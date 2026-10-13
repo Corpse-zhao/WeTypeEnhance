@@ -295,27 +295,70 @@ static void WTE_DumpTree(UIView *v, int depth, NSMutableString *out) {
     for (UIView *s in v.subviews) WTE_DumpTree(s, depth + 1, out);
 }
 
+// 诊断用小工具（实现在下面的「透明底清理」一节，这里先声明）
+static void WTE_CollectViewLayers(UIView *v, NSMutableSet *set, int depth);
+static int  WTE_CountDecorationSublayers(UIView *v, NSSet *viewLayers);
+
+// 这里不用 UIColor 的私有方法，只走公开的 getRed/green/blue/alpha
+static void WTE_DiagColorRGBA(UIColor *col, CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
+    *r = *g = *b = *a = 0;
+    if (!col) return;
+    @try {
+        CGFloat rr = 0, gg = 0, bb = 0, aa = 0;
+        if ([col getRed:&rr green:&gg blue:&bb alpha:&aa]) { *r = rr; *g = gg; *b = bb; *a = aa; return; }
+        CGFloat w = 0, al = 0;
+        if ([col getWhite:&w alpha:&al]) { *r = *g = *b = w; *a = al; }
+    } @catch (__unused NSException *e) {}
+}
+
+// 本类【自己】是否实现了某个方法（不沿继承链）—— 用来判断「是不是它自己画的」
+static BOOL WTE_DiagImplements(Class c, const char *selName) {
+    if (!c) return NO;
+    SEL sel = sel_registerName(selName);
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(list[i]) == sel) { found = YES; break; }
+    }
+    if (list) free(list);
+    return found;
+}
+
 // —— 祖先链快照 ——
 // 背景类问题的另一半线索：底色可能压根不在键盘子树里，而在【祖先】或
 // 【同层兄弟】上。这里从键盘容器一路往上打到窗口（含窗口），
 // 并把每一层排在它前面的兄弟视图也列出来 —— 谁在画底色一眼可见。
+//
+// v1.8.5 追加：sl=装饰子层数 / f=CA滤镜 / bf=背景滤镜 / dR=自己实现了 drawRect:
+// 这几个字段是关键 —— 视图树的 backgroundColor 和 layer.contents 都清干净了
+// 却还能看见底色，那底色只可能藏在这四样里：
+//   · layer.sublayers 里的【装饰层】（渐变层 / 形状层 / 边框层，完全不在 subviews 里）
+//   · layer.filters / layer.backgroundFilters（CA 滤镜，毛玻璃「材质」就是这么来的）
+//   · 视图自己 drawRect: 画进 backing store 的内容
 static void WTE_DumpOneLine(UIView *v, const char *tag, NSMutableString *out) {
     if (!v) return;
     CGFloat r = 0, g = 0, b = 0, a = 0;
-    CGColorRef cg = v.backgroundColor.CGColor;
-    if (cg) {
-        const CGFloat *comp = CGColorGetComponents(cg);
-        size_t n = CGColorGetNumberOfComponents(cg);
-        if (comp) {
-            if (n >= 4) { r = comp[0]; g = comp[1]; b = comp[2]; a = comp[3]; }
-            else if (n >= 2) { r = g = b = comp[0]; a = comp[1]; }
-        }
-    }
-    [out appendFormat:@"  %s %@ f(%.0f,%.0f,%.0f,%.0f) bg(%.2f,%.2f,%.2f,%.2f) op=%d ct=%d al=%.2f z=%lu\n",
+    WTE_DiagColorRGBA(v.backgroundColor, &r, &g, &b, &a);
+
+    int filters = 0, bgFilters = 0;
+    @try {
+        id f = [v.layer valueForKey:@"filters"];
+        if ([f isKindOfClass:[NSArray class]] && [(NSArray *)f count] > 0) filters = (int)[(NSArray *)f count];
+        id bf = [v.layer valueForKey:@"backgroundFilters"];
+        if ([bf isKindOfClass:[NSArray class]] && [(NSArray *)bf count] > 0) bgFilters = (int)[(NSArray *)bf count];
+    } @catch (__unused NSException *e) {}
+
+    [out appendFormat:
+     @"  %s %@ f(%.0f,%.0f,%.0f,%.0f) bg(%.2f,%.2f,%.2f,%.2f) op=%d ct=%d al=%.2f z=%lu "
+     @"sl=%lu f=%d bf=%d dR=%d ivs=%@\n",
      tag, NSStringFromClass([v class]),
      v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
      r, g, b, a, v.isOpaque ? 1 : 0, v.layer.contents ? 1 : 0, v.alpha,
-     (unsigned long)(v.superview ? [v.superview.subviews indexOfObject:v] : 0)];
+     (unsigned long)(v.superview ? [v.superview.subviews indexOfObject:v] : 0),
+     (unsigned long)v.layer.sublayers.count, filters, bgFilters,
+     WTE_DiagImplements([v class], "drawRect:") ? 1 : 0,
+     (v.layer.delegate == v ? @"self" : @"other")];
 }
 
 static void WTE_DumpAncestors(UIView *kb, NSMutableString *out) {
@@ -326,7 +369,12 @@ static void WTE_DumpAncestors(UIView *kb, NSMutableString *out) {
     int hops = 0;
     while (p && hops < 12) {
         WTE_DumpOneLine(p, "ANC ", out);
-        if ([p isKindOfClass:[UIWindow class]]) { [out appendString:@"  ^^ 这是窗口，祖先链到此为止\n"]; break; }
+        if ([p isKindOfClass:[UIWindow class]]) {
+            UIWindow *w = (UIWindow *)p;
+            [out appendFormat:@"  ^^ 这是窗口，祖先链到此为止；window.opaque=%d 窗口层子层=%lu\n",
+             w.opaque ? 1 : 0, (unsigned long)w.layer.sublayers.count];
+            break;
+        }
         // 同层里排在「kb 这一支」前面（z 序更低）的兄弟
         for (UIView *sib in p.subviews) {
             if (sib == child) break;
@@ -337,6 +385,65 @@ static void WTE_DumpAncestors(UIView *kb, NSMutableString *out) {
         hops++;
     }
     if (!p || hops >= 12) [out appendString:@"  (祖先链没走到窗口)\n"];
+}
+
+// —— 底板普查：清完之后，整个窗口里还有谁「画得出东西」？——
+// 这是这个 bug 的判决性证据：
+//   · 有输出 → 照单抓人，下一版精准打掉
+//   · 空     → 说明底色根本不在本进程的视图树里（只在宿主 App / 系统侧合成），
+//              那就必须改用「注入宿主 App」的路线
+static void WTE_DumpPaintCensus(UIView *kb, NSMutableString *out) {
+    if (!kb || !out) return;
+    UIWindow *w = kb.window;
+    if (!w) { [out appendString:@"\n===== 底板普查：拿不到窗口，跳过 =====\n"]; return; }
+
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    WTE_CollectViewLayers(w, viewLayers, 0);
+
+    [out appendString:@"\n===== 清完之后「还能画出底色」的东西（底板普查）=====\n"];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+    int guard = 0, lines = 0;
+    while (stack.count > 0 && guard < 5000) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in v.subviews) [stack addObject:s];
+
+        NSMutableArray *why = [NSMutableArray array];
+        CGFloat r = 0, g = 0, b = 0, a = 0;
+        WTE_DiagColorRGBA(v.backgroundColor, &r, &g, &b, &a);
+        if (a > 0.02) [why addObject:[NSString stringWithFormat:@"bg(%.2f,%.2f,%.2f,%.2f)", r, g, b, a]];
+        if (v.layer.contents) [why addObject:@"contents"];
+        int deco = WTE_CountDecorationSublayers(v, viewLayers);
+        if (deco > 0) [why addObject:[NSString stringWithFormat:@"装饰子层×%d", deco]];
+        if ([v isKindOfClass:[UIVisualEffectView class]] && ((UIVisualEffectView *)v).effect) {
+            [why addObject:@"毛玻璃"];
+        }
+        @try {
+            id f = [v.layer valueForKey:@"filters"];
+            if ([f isKindOfClass:[NSArray class]] && [(NSArray *)f count] > 0) [why addObject:@"filters"];
+            id bf = [v.layer valueForKey:@"backgroundFilters"];
+            if ([bf isKindOfClass:[NSArray class]] && [(NSArray *)bf count] > 0) [why addObject:@"backgroundFilters"];
+        } @catch (__unused NSException *e) {}
+        if (v.layer.borderWidth > 0.01) {
+            [why addObject:[NSString stringWithFormat:@"border%.1f", v.layer.borderWidth]];
+        }
+        if (WTE_DiagImplements([v class], "drawRect:")) [why addObject:@"drawRect:"];
+        if (v.alpha < 0.99) [why addObject:[NSString stringWithFormat:@"alpha%.2f", v.alpha]];
+
+        if (why.count > 0 && lines < 140) {
+            lines++;
+            [out appendFormat:@"  %@ f(%.0f,%.0f,%.0f,%.0f) → %@%@\n",
+             NSStringFromClass([v class]),
+             v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
+             [why componentsJoinedByString:@", "],
+             (v == kb ? @"   ←【键盘容器本身】" : @"")];
+        }
+    }
+    if (lines == 0) {
+        [out appendString:@"  （空！本进程整个窗口里没有任何视图还能画底色\n"
+                          "    ⇒ 底色来自【进程外 / 系统侧合成】，必须走「注入宿主 App」路线）\n"];
+    }
 }
 #else
 #define WTE_Diag(...) do {} while (0)
@@ -752,6 +859,77 @@ static BOOL WTE_LooksLikeSkinImage(UIView *v, CGSize kb) {
     return (s.width >= kb.width * 0.85 && s.height >= kb.height * 0.5);
 }
 
+// ═══════════ v1.8.5：最后两个藏身处 ═══════════
+//
+// v1.8.4 的诊断报告把范围逼死了：视图树里所有 backgroundColor 全是 0、
+// 所有 layer.contents 全是 0、祖先链也全清干净了 —— 但底色还在。
+//
+// 那么底色只可能藏在「不看视图树就看不见」的地方，一共三样：
+//   ① layer.sublayers 里的【装饰层】：渐变层 / 形状层 / 边框层。
+//      它们根本不出现在 subviews 里，只清 backgroundColor 一万次也扫不到。
+//   ② layer.filters / layer.backgroundFilters：CoreAnimation 滤镜。
+//      「毛玻璃 / 玻璃材质」背景就是这么实现的 —— 它不是一个视图，
+//      而是让图层对【身后内容】做一次高斯模糊。
+//      ⚠️ 注意它和 UIVisualEffectView 是两码事：前者是图层滤镜，
+//         后者是一个真实视图（我们早就清过了）。这就是之前一直漏掉的那一个。
+//   ③ 视图自己用 drawRect: 画进 backing store 的内容。
+//
+// 判断「哪些子层是装饰层」有个精确又安全的办法：
+//   把整棵窗口树里【所有视图的 layer】收集成一个集合，
+//   那么某个 layer 的 sublayers 中不在这个集合里的，就一定不是任何视图的层
+//   → 纯装饰层，删掉它不会带走任何视图的内容。
+
+static void WTE_CollectViewLayers(UIView *v, NSMutableSet *set, int depth) {
+    if (!v || !set || depth > 40) return;
+    if (v.layer) [set addObject:[NSValue valueWithPointer:(__bridge const void *)(v.layer)]];
+    for (UIView *s in v.subviews) WTE_CollectViewLayers(s, set, depth + 1);
+}
+
+static int WTE_CountDecorationSublayers(UIView *v, NSSet *viewLayers) {
+    if (!v || !viewLayers) return 0;
+    int n = 0;
+    for (CALayer *sl in v.layer.sublayers) {
+        NSValue *pv = [NSValue valueWithPointer:(__bridge const void *)(sl)];
+        if (![viewLayers containsObject:pv]) n++;
+    }
+    return n;
+}
+
+// 抹掉一个图层身上的滤镜（毛玻璃材质就是这么来的）。
+// filters / backgroundFilters 在 iOS 的 CALayer 上不是公开属性，所以走 KVC + @try。
+static void WTE_ClearLayerFilters(UIView *v) {
+    if (!v) return;
+    @try {
+        id f = [v.layer valueForKey:@"filters"];
+        if ([f isKindOfClass:[NSArray class]] && [(NSArray *)f count] > 0) {
+            [v.layer setValue:nil forKey:@"filters"];
+        }
+    } @catch (__unused NSException *e) {}
+    @try {
+        id bf = [v.layer valueForKey:@"backgroundFilters"];
+        if ([bf isKindOfClass:[NSArray class]] && [(NSArray *)bf count] > 0) {
+            [v.layer setValue:nil forKey:@"backgroundFilters"];
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+// 删掉一个视图图层上的【装饰子层】（不是任何视图的层）。
+// 只在「祖先」和「没有内容的纯背景层」上用，绝不碰键盘内容。
+static void WTE_StripDecorationSublayers(UIView *v, NSSet *viewLayers) {
+    if (!v || !viewLayers) return;
+    NSArray *subs = [v.layer.sublayers copy];
+    for (CALayer *sl in subs) {
+        NSValue *pv = [NSValue valueWithPointer:(__bridge const void *)(sl)];
+        if ([viewLayers containsObject:pv]) continue;   // 是某个视图的层，绝不能动
+        NSString *cls = NSStringFromClass([sl class]);
+        @try {
+            [sl removeFromSuperlayer];
+            WTE_Diag(@"    [strip] %@ 上的装饰层 %@ 已移除",
+                     NSStringFromClass([v class]), cls);
+        } @catch (__unused NSException *e) {}
+    }
+}
+
 // 窗口级兜底清扫：把整棵窗口树里「大面积 + 无内容」的纯背景层全清掉，
 // 但【绝不进键盘容器 kb 的子树】—— 那里面是字母、图标、候选词。
 static void WTE_ClearWindowBackgrounds(UIView *kb) {
@@ -773,8 +951,10 @@ static void WTE_ClearWindowBackgrounds(UIView *kb) {
             BOOL big = (area >= kbArea * 0.35);
             if (WTE_LooksLikeSkinImage(s, kb.bounds.size)) {
                 WTE_ClearLayerPaintDeep(s);
+                WTE_ClearLayerFilters(s);
             } else if (big && !WTE_SubtreeHasContent(s, 0)) {
                 WTE_ClearLayerPaintDeep(s);
+                WTE_ClearLayerFilters(s);
             } else {
                 [stack addObject:s];                     // 有内容 → 只往下找，不动它
             }
@@ -791,6 +971,13 @@ static void WTE_ClearKeyboardAncestors(UIView *kb) {
     if (seen && [seen containsObject:@(token)]) return;   // 本配置已处理过，绝不重复扫
 
     CGSize kbSize = kb.bounds.size;
+
+    // 先把整棵窗口树里「所有视图的 layer」收成一个集合。
+    // 有了它才能精确区分「装饰层」和「某个视图的层」——
+    // 删装饰层安全，删视图层会把子视图一起搞没。
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    if (kb.window) WTE_CollectViewLayers(kb.window, viewLayers, 0);
+
     UIView *p = kb.superview;
     UIView *child = kb;
     int hops = 0;
@@ -798,19 +985,32 @@ static void WTE_ClearKeyboardAncestors(UIView *kb) {
     while (p && hops < 10) {
         // A. 祖先自己那一层：直接清（不下探，绝不碰后代里的文字/图标）
         WTE_ClearLayerPaint(p);
+        // A2. ★ v1.8.5 新枪口：祖先身上的 CA 滤镜（毛玻璃「材质」就是它画的）
+        //     它不是一个视图，只清 backgroundColor / contents 永远扫不到。
+        WTE_ClearLayerFilters(p);
+        // A3. ★ v1.8.5 新枪口：祖先图层上的【装饰子层】（渐变层 / 形状层 / 边框层）
+        //     它们也不在 subviews 里，视图树快照根本打印不出来。
+        WTE_StripDecorationSublayers(p, viewLayers);
 
         // B. 同层里排在「我们这一支」前面的兄弟 —— 它们也是在我们后面画的
         for (UIView *sib in [p.subviews copy]) {
             if (sib == child) break;          // 走到我们这一支就停
-            if (WTE_LooksLikeSkinImage(sib, kbSize)) { WTE_ClearLayerPaintDeep(sib); continue; }
+            if (WTE_LooksLikeSkinImage(sib, kbSize)) {
+                WTE_ClearLayerPaintDeep(sib);
+                WTE_ClearLayerFilters(sib);
+                continue;
+            }
             if (WTE_SubtreeHasContent(sib, 0)) continue;   // 有文字/图标 → 不动
             WTE_ClearLayerPaintDeep(sib);
+            WTE_ClearLayerFilters(sib);
         }
 
         if ([p isKindOfClass:[UIWindow class]]) {
             UIWindow *w = (UIWindow *)p;
             if (w.opaque) w.opaque = NO;
             WTE_SetClearBackground(w);
+            WTE_ClearLayerFilters(w);
+            WTE_StripDecorationSublayers(w, viewLayers);
             break;
         }
         child = p;
@@ -823,7 +1023,11 @@ static void WTE_ClearKeyboardAncestors(UIView *kb) {
     if (win) {
         if (win.opaque) win.opaque = NO;
         WTE_SetClearBackground(win);
+        WTE_ClearLayerFilters(win);
     }
+
+    // 键盘容器自己身上的滤镜也一并清掉（有些皮肤把材质挂在最外层）
+    WTE_ClearLayerFilters(kb);
 
     // C. 兜底大扫除：整个键盘窗口里「大面积 + 没内容」的层一律清掉。
     //    有些皮肤的底图并不挂在键盘容器的祖先链上，而是挂在窗口根视图下面的
@@ -835,6 +1039,52 @@ static void WTE_ClearKeyboardAncestors(UIView *kb) {
     if (!seen) seen = [NSMutableSet new];
     [seen addObject:@(token)];
     objc_setAssociatedObject(kb, kWTEAncestorKey, seen, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ═══ v1.8.5：UIInputView 的「系统键盘背景」═══
+//
+// 键盘扩展的 UIInputView 默认样式是 UIInputViewStyleKeyboard，iOS 会给它装上
+// 一套 backgroundEffects（就是那个毛玻璃「材质」背景）。这套背景【不是一个视图】，
+// 所以视图树快照里永远看不到它 —— 这正好解释了
+// 「backgroundColor 全 0、contents 全 0、祖先链全清干净，人却还能看见底色」。
+//
+// 而且光调一次 setBackgroundEffects:nil 不够：输入法可能在我们之后又把它设回去。
+// 所以这里 (a) 把 setter 钩住，透明底模式下任何设置一律吃掉；
+//          (b) 顺手把 inputViewStyle 从 Keyboard(1) 改成 Default(0)。
+//
+// UIInputViewStyle: 0 = Default（透明背景）  1 = Keyboard（系统键盘背景）
+static BOOL WTE_ForceInputViewTransparent(UIView *kb, NSString **report) {
+    if (!kb) return NO;
+    UIView *p = kb.superview;
+    int hops = 0;
+    while (p && hops < 10) {
+        if ([NSStringFromClass([p class]) isEqualToString:@"UIInputView"]) break;
+        p = p.superview;
+        hops++;
+    }
+    if (!p) { if (report) *report = @"没找到 UIInputView 祖先"; return NO; }
+
+    // 先读一下当前 style，作为证据记进诊断报告
+    long style = -1;
+    SEL getS = NSSelectorFromString(@"inputViewStyle");
+    if ([p respondsToSelector:getS]) {
+        @try { style = ((long (*)(id, SEL))objc_msgSend)(p, getS); }
+        @catch (__unused NSException *e) {}
+    }
+
+    SEL setS = NSSelectorFromString(@"setInputViewStyle:");
+    if ([p respondsToSelector:setS] && style != 0) {
+        @try {
+            ((void (*)(id, SEL, long))objc_msgSend)(p, setS, 0);   // → Default（透明）
+            if (report) *report = [NSString stringWithFormat:
+                @"UIInputView style %ld → 0（Default/透明）", style];
+            return YES;
+        } @catch (__unused NSException *e) {}
+    }
+
+    if (report) *report = [NSString stringWithFormat:
+        @"UIInputView style=%ld（本来就是透明，或设置不被支持）", style];
+    return NO;
 }
 
 static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
@@ -861,6 +1111,20 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
         //   证据：纯色模式能盖住它（说明它在下层），透明底一清空就露出来了。
         //   所以必须顺着祖先链往上清，否则永远透不出去。
         WTE_ClearKeyboardAncestors(self);
+
+        // ★ v1.8.5：UIInputView 的系统键盘背景（backgroundEffects / inputViewStyle）
+        //   这一项不是视图，视图树快照看不到，是「全清了还有底色」的头号嫌疑。
+#if WTE_LOG_ENABLE
+        static BOOL sLoggedInputView = NO;
+        NSString *rpt = nil;
+        BOOL changed = WTE_ForceInputViewTransparent(self, &rpt);
+        if (changed || !sLoggedInputView) {
+            sLoggedInputView = YES;
+            WTE_Diag(@"[inputView] %@", rpt ?: @"-");
+        }
+#else
+        WTE_ForceInputViewTransparent(self, NULL);
+#endif
     }
 
     // 键盘整体位移：只在目标值变化时才写 transform，
@@ -1151,6 +1415,7 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                                     @"\n===== 键盘视图树快照（前 3 层）=====\n"];
                                 WTE_DumpTree(kb, 0, dump);
                                 WTE_DumpAncestors(kb, dump);
+                                WTE_DumpPaintCensus(kb, dump);
                                 WTE_Diag(@"%@", dump);
                                 WTE_DiagFlush(@"tree");
                             } @catch (__unused NSException *e) {}
@@ -1283,6 +1548,33 @@ static int WTE_InstallHooks(void) {
     return hooked;
 }
 
+// ═══ v1.8.5：系统侧 hook —— UIInputView 的「键盘背景」═══
+// setBackgroundEffects: 是 UIInputView 决定自己「毛玻璃材质背景」的私有入口。
+// 透明底模式下直接把 setter 吃掉，任何一方（输入法 / UIKit）想设回去都无效。
+static void (*gOrigSetBackgroundEffects)(id, SEL, id) = NULL;
+
+static void WTE_SetBackgroundEffectsReplacement(id self, SEL _cmd, id effects) {
+    BOOL transparent = (gConfig && (gConfig.keyboardTransparent ||
+                                    [gConfig.bgMode isEqualToString:@"transparent"]));
+    if (transparent) effects = nil;
+    if (gOrigSetBackgroundEffects) gOrigSetBackgroundEffects(self, _cmd, effects);
+}
+
+static int WTE_InstallSystemHooks(void) {
+    int n = 0;
+    Class iv = NSClassFromString(@"UIInputView");
+    SEL s = NSSelectorFromString(@"setBackgroundEffects:");
+    if (iv && [iv instancesRespondToSelector:s]) {
+        MSHookMessageEx(iv, s, (IMP)&WTE_SetBackgroundEffectsReplacement,
+                        (IMP *)&gOrigSetBackgroundEffects);
+        n++;
+        WTE_Diag(@"  [sys] UIInputView -setBackgroundEffects: 已接管（透明底时强制 nil）");
+    } else {
+        WTE_Diag(@"  [sys] UIInputView 没有 setBackgroundEffects:，跳过");
+    }
+    return n;
+}
+
 #pragma mark - ========== SpringBoard 偏好中继 ==========
 //
 // 1.7.0 实测定论：键盘扩展沙盒里所有偏好通道全部不可读
@@ -1355,6 +1647,123 @@ static void WTE_RelayNotifyCallback(CFNotificationCenterRef center, void *observ
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     WTE_RelayPushConfig();
+}
+
+#pragma mark - ========== 宿主 App 侧：清掉键盘在宿主机里的那层底 ==========
+//
+// v1.8.5 新增，专门兜住「扩展进程里已经全透明、人却还能看见底色」的情况。
+//
+// 第三方键盘的界面是【远程】渲染的：扩展进程里的 _UIHostedWindow 只是一层壳，
+// 真正把键盘显示到屏幕上的窗口（UIRemoteKeyboardWindow → UIInputSetContainerView
+// → UIInputSetHostView）存在于【宿主 App 的进程】里。系统有可能在那里垫一层
+// 键盘底色 —— 那层我们在扩展进程里无论怎么清都碰不到，因为根本不在同一个进程。
+//
+// 做法（刻意保守）：
+//   · 绝不 hook 任何 layoutSubviews —— 宿主 App 里挂布局 hook 一旦形成布局反馈
+//     死循环，就是「微信整个卡死」，代价太大。
+//   · 只在「键盘将要弹出 / 已经弹出」的通知里，延迟几个时间点清一次属性。
+//     通知驱动的写字操作不会自我触发，零死循环风险。
+//   · 只在透明底模式做工（配置从宿主自己容器里的那份 relay 副本读）。
+// ⚠️ 只认「键盘窗口」这几个类名，绝不放 _UIHostedWindow / UIHostingView ——
+//    那两个在宿主里可能被小程序之类的东西用着，清它会有副作用。
+static NSArray<NSString *> *WTE_HostBackdropClasses(void) {
+    return @[@"UIRemoteKeyboardWindow", @"UIInputSetContainerView",
+             @"UIInputSetHostView", @"UIKeyboardHostView"];
+}
+
+static BOOL WTE_HostWantsTransparent(void) {
+    @try {
+        NSDictionary *d = nil;
+        NSString *p = WTEPref_HomePath(@"Documents/WeTypeEnhance/config.plist");
+        if (p) d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (![d isKindOfClass:[NSDictionary class]] || d.count == 0) {
+            d = [NSDictionary dictionaryWithContentsOfFile:
+                 [NSHomeDirectory() stringByAppendingPathComponent:
+                  @"Library/Preferences/com.colorblack.wetypeenhance.plist"]];
+        }
+        if (![d isKindOfClass:[NSDictionary class]]) return NO;
+        id v = d[@"bgMode"];
+        return ([v isKindOfClass:[NSString class]] && [v isEqualToString:@"transparent"]);
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+static void WTE_HostSweepView(UIView *v, NSSet *viewLayers, int depth) {
+    if (!v || depth > 14) return;
+    for (UIView *s in [v.subviews copy]) {
+        @try {
+            NSString *cls = NSStringFromClass([s class]);
+            for (NSString *n in WTE_HostBackdropClasses()) {
+                if ([cls isEqualToString:n]) {
+                    WTE_ClearLayerPaint(s);
+                    WTE_ClearLayerFilters(s);
+                    WTE_StripDecorationSublayers(s, viewLayers);
+                    if (s.opaque) s.opaque = NO;
+                    break;
+                }
+            }
+        } @catch (__unused NSException *e) {}
+        WTE_HostSweepView(s, viewLayers, depth + 1);
+    }
+}
+
+static void WTE_HostClearKeyboardBackdrop(void) {
+    @try {
+        NSArray *wins = nil;
+        @try {
+            Class appCls = NSClassFromString(@"UIApplication");
+            id app = ((id (*)(id, SEL))objc_msgSend)(appCls, NSSelectorFromString(@"sharedApplication"));
+            wins = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
+        } @catch (__unused NSException *e) {}
+        if (![wins isKindOfClass:[NSArray class]] || wins.count == 0) return;
+
+        NSMutableSet *viewLayers = [NSMutableSet set];
+        for (UIWindow *w in wins) WTE_CollectViewLayers(w, viewLayers, 0);
+        for (UIWindow *w in wins) {
+            // 宿主侧的键盘窗口自己也可能是那层底
+            for (NSString *n in WTE_HostBackdropClasses()) {
+                if ([NSStringFromClass([w class]) isEqualToString:n]) {
+                    WTE_ClearLayerPaint(w);
+                    WTE_ClearLayerFilters(w);
+                    if (w.opaque) w.opaque = NO;
+                    break;
+                }
+            }
+            WTE_HostSweepView(w, viewLayers, 0);
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+// 键盘动画期间 UIKeyboardWillChangeFrame 会狂发（每帧一条）。
+// 不做节流的话，每一次都要遍历整个宿主 App 的窗口树 —— 微信会被拖卡。
+// 这里 0.45 秒内只放行一批。（本函数总在主线程被调用，无需加锁）
+static NSTimeInterval gHostLastSweepAt = 0;
+static void WTE_HostScheduleSweeps(void) {
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - gHostLastSweepAt < 0.45) return;
+    gHostLastSweepAt = now;
+    // 键盘弹出是个动画过程，窗口和子视图是逐步建好的 —— 多打几个时间点。
+    for (NSNumber *d in @[@0.05, @0.35, @0.90]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (WTE_HostWantsTransparent()) WTE_HostClearKeyboardBackdrop();
+        });
+    }
+}
+
+static void WTE_InstallHostKeyboardSweep(void) {
+    @try {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        NSOperationQueue *q = [NSOperationQueue mainQueue];
+        for (NSString *name in @[UIKeyboardWillShowNotification, UIKeyboardDidShowNotification,
+                                 UIKeyboardWillChangeFrameNotification]) {
+            [nc addObserverForName:name object:nil queue:q
+                        usingBlock:^(__unused NSNotification *note) {
+                WTE_HostScheduleSweeps();
+            }];
+        }
+        NSLog(@"[WeTypeEnhance][host] 宿主侧键盘背景清理已就绪 (%@)",
+              [[NSBundle mainBundle] bundleIdentifier]);
+    } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - ========== 初始化 ==========
@@ -1469,7 +1878,16 @@ static void WTE_Init(void) {
             if (NSClassFromString(cn)) { isWeType = YES; break; }
         }
     }
-    if (!isWeType) return;
+    if (!isWeType) {
+        // —— 宿主 App 侧通道（v1.8.5）——
+        // 不是微信输入法自己的进程，但如果是 App（有 UIApplication），
+        // 就在这里挂「键盘弹出 → 清掉键盘窗口背景」的清扫。
+        // 这一步只碰系统那几个键盘容器类，绝不装键盘视图 hook，绝不 hook 布局。
+        if (NSClassFromString(@"UIApplication")) {
+            WTE_InstallHostKeyboardSweep();
+        }
+        return;
+    }
 
     gPrefQueue = dispatch_queue_create("com.colorblack.wetypeenhance.prefs", DISPATCH_QUEUE_SERIAL);
 #if WTE_LOG_ENABLE
@@ -1480,7 +1898,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.4 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.5 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
@@ -1511,7 +1929,8 @@ static void WTE_Init(void) {
     // 白名单 hook（延迟到主线程，等 dyld 把输入法类都注册好）
     dispatch_async(dispatch_get_main_queue(), ^{
         int hooked = WTE_InstallHooks();
-        WTE_Diag(@"=== 白名单命中并 hook %d 个类 ===", hooked);
+        int sysHooked = WTE_InstallSystemHooks();
+        WTE_Diag(@"=== 白名单命中并 hook %d 个类（另有 %d 个系统 hook）===", hooked, sysHooked);
         WTE_DiagFlush(@"hooks");
     });
 }

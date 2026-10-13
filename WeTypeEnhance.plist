@@ -12,10 +12,19 @@
     <dict>
         <key>Bundles</key>
         <array>
+            <!-- 键盘扩展本体（主体逻辑在这里） -->
             <string>com.tencent.wetype.keyboard</string>
             <string>com.tencent.xin.keyboard</string>
             <string>com.tencent.wetype</string>
+            <!-- 阳性对照 + 配置中继（SpringBoard 无沙盒） -->
             <string>com.apple.springboard</string>
+            <!-- v1.8.5：宿主 App 侧。第三方键盘真正的窗口
+                 （UIRemoteKeyboardWindow / UIInputSetHostView）在宿主进程里，
+                 系统若在那里垫了一层键盘底色，只有注入宿主才清得掉。
+                 这些进程里【只挂键盘弹出通知驱动的清扫】，不装任何键盘视图 hook。 -->
+            <string>com.tencent.xin</string>
+            <string>com.tencent.wework</string>
+            <string>com.apple.mobilesafari</string>
         </array>
         <key>Executables</key>
         <array>
