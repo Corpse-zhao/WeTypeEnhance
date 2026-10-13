@@ -192,6 +192,7 @@ static NSString *WTE_StringPref(NSString *key, NSString *def) {
 static NSMutableString *gDiag;
 static dispatch_queue_t gDiagQueue;
 static BOOL gDiagFlushedClassScan = NO;
+static BOOL gDiagDumpedTree = NO;
 static NSMutableSet *gLayoutSeen;
 
 #if WTE_LOG_ENABLE
@@ -263,6 +264,35 @@ static void WTE_Diag(NSString *fmt, ...) {
     if (!gDiag) gDiag = [NSMutableString new];
     [gDiag appendFormat:@"%@\n", line];
     NSLog(@"[WeTypeEnhance] %@", line);
+}
+
+// —— 键盘视图树快照 ——
+// 背景类问题光靠猜没用，这里把最外层键盘容器的前几层子树打出来：
+// 类名 / frame / 底色 RGBA / 是否不透明 / layer 有没有内容 / 有没有自己的模糊效果。
+// 谁在画底色一眼就看出来。
+static void WTE_DumpTree(UIView *v, int depth, NSMutableString *out) {
+    if (!v || depth > 3 || out.length > 5000) return;
+    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
+                                      withString:@" " startingAtIndex:0];
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    CGColorRef cg = v.backgroundColor.CGColor;
+    if (cg) {
+        CGColorSpaceRef cs = CGColorGetColorSpace(cg);
+        CGColorSpaceModel model = cs ? CGColorSpaceGetModel(cs) : kCGColorSpaceModelUnknown;
+        const CGFloat *comp = CGColorGetComponents(cg);
+        size_t n = CGColorGetNumberOfComponents(cg);
+        if (comp) {
+            if (model == kCGColorSpaceModelMonochrome && n >= 2) { r = g = b = comp[0]; a = comp[1]; }
+            else if (n >= 4) { r = comp[0]; g = comp[1]; b = comp[2]; a = comp[3]; }
+            else if (n >= 2) { r = g = b = comp[0]; a = comp[1]; }
+        }
+    }
+    [out appendFormat:@"%@%@ f(%.0f,%.0f,%.0f,%.0f) bg(%.2f,%.2f,%.2f,%.2f) op=%d ct=%d al=%.2f\n",
+     pad, NSStringFromClass([v class]),
+     v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
+     r, g, b, a, v.isOpaque ? 1 : 0,
+     v.layer.contents ? 1 : 0, v.alpha];
+    for (UIView *s in v.subviews) WTE_DumpTree(s, depth + 1, out);
 }
 #else
 #define WTE_Diag(...) do {} while (0)
@@ -388,6 +418,9 @@ static dispatch_queue_t gPrefQueue;
 static void WTE_ReloadConfig(void) {
     gConfigDict = WTE_ReadRawPrefs();   // 刷新原始快照（缓存失效）
     gConfig = [WTEConfig loadConfig];
+#if WTE_LOG_ENABLE
+    gDiagDumpedTree = NO;               // 配置变了，允许下一轮再拍一张视图树快照
+#endif
 }
 
 static void WTE_PrefsChangedCallback(CFNotificationCenterRef center, void *observer,
@@ -588,6 +621,34 @@ static void WTE_SetClearBackground(UIView *v) {
     v.backgroundColor = [UIColor clearColor];
 }
 
+// 把「中间层」自己画的背景彻底抹掉：底色 / 背景图 / layer 内容 / 毛玻璃。
+// 微信输入法键盘的可见底色往往不是 backgroundColor，而是一张纹理图
+// （layer.contents 或 UIImageView.image）或毛玻璃层 —— 只清颜色是没用的。
+// ⚠️ 绝不能在「按键 / 工具栏内部」调用：那里面有字母、图标，
+//    清掉 layer.contents 会把 UILabel 的文字一起抹掉。
+static void WTE_ClearLayerPaint(UIView *v) {
+    if (!v) return;
+    WTE_SetClearBackground(v);
+    if (v.isOpaque) v.opaque = NO;
+
+    if ([v isKindOfClass:[UIImageView class]]) {
+        UIImageView *iv = (UIImageView *)v;
+        if (iv.image) iv.image = nil;
+    } else if (![v isKindOfClass:[UILabel class]]) {
+        // UILabel 的 layer.contents 就是它渲染出的文字，必须跳过
+        if (v.layer.contents) v.layer.contents = nil;
+    }
+
+    if ([v isKindOfClass:[UIVisualEffectView class]]) {
+        UIVisualEffectView *ev = (UIVisualEffectView *)v;
+        if (ev.effect) ev.effect = nil;
+    }
+    SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
+    if ([v respondsToSelector:sfx]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(v, sfx, nil);
+    }
+}
+
 static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
     BOOL transparent = (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]);
     BOOL solidBg     = (c.bgEnabled && !transparent);
@@ -705,11 +766,22 @@ static void WTE_ApplyBarOrCandidate(UIView *self, WTEConfig *c) {
     }
 }
 
-// 是否已有「键盘容器」祖先 —— 背景只画在最外层，嵌套容器互相叠图层会花
+// 是否已有「键盘容器」祖先 —— 背景只画在最外层，嵌套容器互相叠图层会花。
+// ⚠️ 只认我们自己的容器类名，不能用「名字里带 Keyboard/InputView」这种模糊判断：
+//    键盘扩展的祖先链里有 UIInputView / UIKeyboardHostView 这类【系统类】，
+//    模糊判断会把所有候选容器全判成「非最外层」→ 谁都不画背景（1.8.0 的隐藏 bug）。
 static BOOL WTE_HasKeyboardAncestor(UIView *v) {
+    static NSArray *kbNames = nil;
+    if (!kbNames) {
+        kbNames = @[@"WBKeyboardView", @"WBKeyboardRootView",
+                    @"WBRootInputView", @"WBMainInputView"];
+    }
     UIView *p = v.superview;
     while (p) {
-        if (WTE_NameIsKeyboard(NSStringFromClass([p class]))) return YES;
+        NSString *n = NSStringFromClass([p class]);
+        for (NSString *k in kbNames) {
+            if ([n isEqualToString:k]) return YES;
+        }
         p = p.superview;
     }
     return NO;
@@ -869,6 +941,17 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                     WTE_ApplyToView(self);
                     WTE_ApplySubtree(self, 0);
+#if WTE_LOG_ENABLE
+                    // 配置变了 → 拍一张视图树快照（最多 3 张，避免诊断文件膨胀）
+                    if (!gDiagDumpedTree) {
+                        gDiagDumpedTree = YES;
+                        NSMutableString *dump = [NSMutableString stringWithString:
+                            @"\n===== 键盘视图树快照（前 3 层）=====\n"];
+                        WTE_DumpTree(self, 0, dump);
+                        WTE_Diag(@"%@", dump);
+                        WTE_DiagFlush(@"tree");
+                    }
+#endif
                 } else {
                     WTE_ApplyToView(self);   // 配置没变、只是尺寸变了：只更新容器自己
                 }
@@ -889,16 +972,15 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
 #endif
 }
 
-// 递归给子树里的键盘元素上色
-// 关键：微信输入法键盘的「可见底色」往往不在 WBKeyboardView 本身，
-// 而是中间那些不带 WB 前缀的子视图自己画的背景 / 毛玻璃层 ——
-// 不清掉它们，容器上画的背景永远被盖住（1.7.1 键盘背景完全不生效的根因）。
-static void WTE_ApplySubtree(UIView *root, int depth) {
+// 递归给子树里的键盘元素上色 / 让中间层让位。
+// protectedZone = YES 表示已经进到「按键 / 工具栏内部」，
+// 那里面的图标和文字绝不能清，只继续找更深处的按键。
+static void WTE_ApplySubtreeEx(UIView *root, int depth, BOOL protectedZone) {
     if (!root || depth > 6) return;
     WTEConfig *c = gConfig;
     if (!c) return;
-    // 需要中间层「让位」：开了背景（纯色/图片）或开了整键盘透明
-    BOOL clearMiddle = (c.bgEnabled || c.keyboardTransparent ||
+    BOOL clearMiddle = (!protectedZone) &&
+                       (c.bgEnabled || c.keyboardTransparent ||
                         [c.bgMode isEqualToString:@"transparent"]);
     NSUInteger clearToken = (NSUInteger)(uintptr_t)c;   // 配置一变就重新清一次
 
@@ -907,32 +989,30 @@ static void WTE_ApplySubtree(UIView *root, int depth) {
             NSString *cls = NSStringFromClass([sub class]);
             BOOL isKey = WTE_NameIsKey(cls);
             BOOL isBar = WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls);
-            BOOL isKB  = WTE_NameIsKeyboard(cls);
-            if (isKB || isKey || isBar) {
+            if (isKey || isBar) {
                 WTE_ApplyToView(sub);
-            } else if (clearMiddle) {
-                // 幂等：同一个配置下只清一次，避免「清 → 重新布局 → 再清」死循环
-                NSNumber *pv = objc_getAssociatedObject(sub, kWTEClearedKey);
-                if (!pv || pv.unsignedIntegerValue != clearToken) {
-                    objc_setAssociatedObject(sub, kWTEClearedKey, @(clearToken),
-                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    // 非键盘元素的中间层：清底色 + 去毛玻璃，让容器背景透出来
-                    // （每一步都先判断当前值，冗余写入本身就会触发布局）
-                    WTE_SetClearBackground(sub);
-                    if (sub.isOpaque) sub.opaque = NO;
-                    if ([sub isKindOfClass:[UIVisualEffectView class]]) {
-                        UIVisualEffectView *ev = (UIVisualEffectView *)sub;
-                        if (ev.effect) ev.effect = nil;
-                    }
-                    SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
-                    if ([sub respondsToSelector:sfx]) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(sub, sfx, nil);
+                WTE_ApplySubtreeEx(sub, depth + 1, YES);   // 进入保护区
+            } else {
+                // ★ 关键修复（v1.8.1）：
+                // 嵌套的键盘容器（WBKeyboardView 套在 WBRootInputView 里）也走这一支 ——
+                // 它们【不该自己画背景】，否则内层的不透明底色会把最外层刚画的背景整个盖住。
+                // 之前这里对嵌套容器调了 WTE_ApplyToView，而那个函数见到「有键盘祖先」就跳过，
+                // 结果内层底色原样保留 → 背景永远看不见。
+                if (clearMiddle) {
+                    NSNumber *pv = objc_getAssociatedObject(sub, kWTEClearedKey);
+                    if (!pv || pv.unsignedIntegerValue != clearToken) {
+                        objc_setAssociatedObject(sub, kWTEClearedKey, @(clearToken),
+                                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        WTE_ClearLayerPaint(sub);
                     }
                 }
+                WTE_ApplySubtreeEx(sub, depth + 1, protectedZone);
             }
-            WTE_ApplySubtree(sub, depth + 1);
         } @catch (__unused NSException *e) {}
     }
+}
+static void WTE_ApplySubtree(UIView *root, int depth) {
+    WTE_ApplySubtreeEx(root, depth, NO);
 }
 
 static void WTE_HookClass(Class c) {
@@ -1195,7 +1275,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.1 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
