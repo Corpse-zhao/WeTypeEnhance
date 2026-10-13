@@ -179,6 +179,45 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     return nil;
 }
 
+// ═══ v1.9.2：收集宿主 App 的回执 ═══
+// 为什么必须由「设置」面板来收：
+//   · 真正的键盘显示位置在宿主 App 进程（微信等）里，透明底必须在那儿动手
+//   · 宿主 App 被自己的沙盒关住，只能写自己容器里的 Documents/WeTypeEnhance/host.txt
+//   · 键盘扩展进程【列不出】/var/mobile/Containers/Data/Application 目录（沙盒挡住），
+//     所以 v1.9.0 的报告里「宿主回执」永远是空的 —— 取证通道本身走错路了
+//   · 而「设置」进程能读 App 容器（配置同步就是这么写进键盘容器的），所以由它来收
+static NSArray<NSString *> *WTEP_CollectHostReports(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *bases = @[@"/var/mobile/Containers/Data/Application",
+                       @"/var/mobile/Containers/Data/PluginKitPlugin"];
+    NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-1800];   // 只看最近半小时
+    for (NSString *base in bases) {
+        NSArray *subs = [fm contentsOfDirectoryAtPath:base error:nil];
+        if (!subs.count) {
+            [out addObject:[NSString stringWithFormat:@"  (%@ 列不出来 —— 本进程读不了 App 容器)", base]];
+            continue;
+        }
+        for (NSString *sub in subs) {
+            NSString *f = [[[base stringByAppendingPathComponent:sub]
+                            stringByAppendingPathComponent:@"Documents/WeTypeEnhance"]
+                           stringByAppendingPathComponent:@"host.txt"];
+            NSDictionary *attr = [fm attributesOfItemAtPath:f error:nil];
+            if (!attr) continue;
+            NSDate *mod = attr[NSFileModificationDate];
+            if (mod && [mod compare:cutoff] == NSOrderedAscending) continue;
+            NSString *txt = [NSString stringWithContentsOfFile:f
+                                                      encoding:NSUTF8StringEncoding error:nil];
+            if (!txt.length) continue;
+            if (txt.length > 7000) txt = [txt substringFromIndex:txt.length - 7000];
+            [out addObject:[NSString stringWithFormat:@"----- %@ -----\n%@", f, txt]];
+            if (out.count >= 10) break;      // 别把弹窗撑爆
+        }
+        if (out.count >= 10) break;
+    }
+    return out;
+}
+
 #pragma mark - 主控制器
 
 @interface WTERootListController : PSListController <UIColorPickerViewControllerDelegate>
@@ -333,9 +372,13 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 
     // ---- 1. 键盘背景（v1.8.0：只保留 纯色 / 透明底） ----
     [specs addObject:[self group:@"键盘背景"
-        footer:@"【透明底】＝ 把键盘自己的底板清空，透出聊天背景（就像微信自带的表情面板那样）。"
-               "【按键透明度】只在透明底下生效：1.0＝不透明（打字最清楚，默认，不影响打字）；"
-               "往左拉按键跟着变透明，能透过按键看到背景；拉到 0 只剩字母，可能不好找按键。"]];
+        footer:@"【透明底】＝ 把键盘自己的底板清空，透出聊天背景（就像微信自带的表情面板那样）。\n"
+               "【按键透明度】＝ 键帽的透明程度，只在「透明底」下生效：\n"
+               "  · 1.0 ＝ 键帽完全不透明（打字最清楚）\n"
+               "  · 0.3 ＝ 默认。键帽半透明，能看见聊天背景，字母依旧清晰 ←「透明但不影响打字」\n"
+               "  · 0.0 ＝ 键帽一点不剩，只剩字母（最好看，但可能不好找按键）\n"
+               "注意：要让它生效，「透明范围」必须是【整键盘透明】；\n"
+               "或者你亲手拉过这个滑条（拉过就两个档都生效）。"]];
     [specs addObject:[self switchRow:@"开启背景" key:kKeyBgEnabled def:NO]];
     [specs addObject:[self choiceRow:@"背景模式" key:kKeyBgMode def:@"solid"
                               values:@[@"solid", @"transparent"]
@@ -344,10 +387,11 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     // 用户实测「打字按不到字母」；1.8.9 起改成半透明帽，既透又看得见。
     [specs addObject:[self choiceRow:@"透明范围" key:kKeyTransScope def:@"bg"
                               values:@[@"bg", @"all"]
-                              titles:@[@"只透底板（按键正常，推荐）", @"整键盘透明（按键半透明）"]]];
-    // v1.9.0：按键透明度滑动条 —— 默认 1.0，完全不影响打字
+                              titles:@[@"只透底板（按键正常，推荐）", @"整键盘透明（按键按下面的滑条变透）"]]];
+    // v1.9.0 引入滑条 / v1.9.2 修好它：默认 0.30，且改成「只降不升」的封顶语义。
+    // 之前默认 1.0 → 整段被跳过 → 滑条怎么拉都没反应（用户报「键盘还是实心」的根因之一）。
     [specs addObject:[self sliderRow:@"按键透明度 (1=不透明 0=全透)"
-                                key:kKeyKeyOpacity def:1.0 min:0.0 max:1.0]];
+                                key:kKeyKeyOpacity def:0.30 min:0.0 max:1.0]];
     [specs addObject:[self colorRow:@"背景颜色" key:kKeyBgColor def:@"#101826"]];
     [specs addObject:[self sliderRow:@"背景不透明度" key:kKeyBgAlpha def:1.0 min:0.0 max:1.0]];
 
@@ -418,7 +462,24 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 - (void)setPref:(id)value forSpecifier:(PSSpecifier *)spec {
     NSString *key = [spec propertyForKey:@"key"];
     WTE_SetPref(key, value);
+    // v1.9.2：滑条拖动时每个像素都会回调一次。之前每次都「全量同步到所有容器 + 整表刷新」，
+    // 结果滑条会被 reloadSpecifiers 顶回旧位置，既拉不动又卡。这里改成松手后再同步。
+    BOOL isSlider = ([spec propertyForKey:@"min"] != nil || [spec propertyForKey:@"max"] != nil);
+    if (isSlider) {
+        [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                                 selector:@selector(wteFinishSliderChange)
+                                                   object:nil];
+        [self performSelector:@selector(wteFinishSliderChange) withObject:nil afterDelay:0.25];
+        return;
+    }
     WTE_SyncConfigToReadablePlaces();   // 同步到键盘扩展容器（沙盒保底通道）
+    WTE_NotifyChanged();
+    [self reloadSpecifiers];
+}
+
+// 滑条松手（0.25s 没有新手势）之后，再全量同步一次
+- (void)wteFinishSliderChange {
+    WTE_SyncConfigToReadablePlaces();
     WTE_NotifyChanged();
     [self reloadSpecifiers];
 }
@@ -755,19 +816,14 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
 // 只挑关键行（透明自检的判决 / 宿主回执 / 当前配置 / 清了什么），弹窗直接看。
 - (void)transVerdict:(PSSpecifier *)spec {
     NSString *path = WTEP_FindDiagPath();
-    if (!path) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没有键盘进程报告"
-            message:@"先注销一次 + 点「重启键盘进程」，然后在微信里弹一次键盘，再回来点这里。"
-            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-        return;
-    }
-    NSString *content = [NSString stringWithContentsOfFile:path
-                                                  encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    // v1.9.2：键盘进程报告还没有时，也不要直接放弃 ——
+    // 宿主 App 的回执是本进程（设置）直接读容器拿的，不依赖键盘进程。
+    NSString *content = path
+        ? ([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"")
+        : @"";
     NSArray *l1 = @[@"占比", @"判决", @"⇒"];                       // 透明自检
     NSArray *l2 = @[@"注入成功", @"[host", @"宿主回执"];             // 宿主侧
-    NSArray *l3 = @[@"当前配置", @"装饰层：摘掉", @"藏掉", @"[allwin]",
+    NSArray *l3 = @[@"当前配置", @"透明:", @"装饰层：摘掉", @"藏掉", @"[allwin]",
                     @"已成功写入", @"最终采用的来源"];
 
     NSMutableArray *all = [NSMutableArray array];
@@ -794,8 +850,23 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
     NSMutableString *msg = [NSMutableString string];
     [msg appendString:@"── 透明自检（关键）──\n"];
     [msg appendString:s1.count ? [s1 componentsJoinedByString:@"\n"] : @"（没有：键盘进程可能没跑新版）\n"];
-    [msg appendString:@"\n── 宿主 App 侧 ──\n"];
-    [msg appendString:s2.count ? [s2 componentsJoinedByString:@"\n"] : @"（没有：宿主 App 没被注入）\n"];
+    [msg appendString:@"\n── 键盘进程里看到的宿主侧 ──\n"];
+    [msg appendString:s2.count ? [s2 componentsJoinedByString:@"\n"] : @"（没有）\n"];
+
+    // v1.9.2：真正的宿主回执由本进程（设置）去 App 容器里收 ——
+    // 键盘扩展被沙盒挡住，永远收不到这几份。
+    NSArray *hosts = WTEP_CollectHostReports();
+    [msg appendString:@"\n── 宿主 App 回执（本进程直接读容器）──\n"];
+    if (hosts.count) {
+        NSMutableArray *trimmed = [NSMutableArray array];
+        for (NSString *h in hosts) {
+            [trimmed addObject:h.length > 2600 ? [h substringToIndex:2600] : h];
+        }
+        [msg appendString:[trimmed componentsJoinedByString:@"\n"]];
+    } else {
+        [msg appendString:@"（一条都没有 ⇒ 宿主 App 侧没被注入，或最近半小时内没弹过键盘）\n"];
+    }
+
     [msg appendString:@"\n── 清理动作 ──\n"];
     [msg appendString:s3.count ? [s3 componentsJoinedByString:@"\n"] : @"（没有）\n"];
 

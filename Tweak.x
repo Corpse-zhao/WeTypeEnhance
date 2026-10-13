@@ -482,8 +482,11 @@ static void WTE_DumpHostReports(NSMutableString *out) {
         }
     }
     if (files == 0) {
-        [out appendString:@"  （一处都没捞到 ⇒ 宿主 App 侧没被注入，或沙盒挡住了；\n"
-                         "    若地址列不出来 = 沙盒挡住，得改用别的取证方式）\n"];
+        [out appendString:
+            @"  （本进程列不出 App 容器是【正常】的 —— 键盘扩展沙盒挡住，不是故障。\n"
+            @"    宿主 App 的回执改由「设置 → 微信输入法增强 → 透明诊断」去收：\n"
+            @"    设置进程能读 App 容器，会把最近半小时的 host.txt 全列出来。\n"
+            @"    所以这一段不用管，看面板里那一段就行）\n"];
     }
 }
 
@@ -546,21 +549,47 @@ static double WTE_RenderOpaqueRatio(UIView *v) {
     return (double)opaque / (double)total;
 }
 
+// v1.9.2：这一项在 v1.9.0 给出了错误结论，因为缺了「渲染器有效性对照」。
+// 实测：扩展进程里的 kb.window 是 _UIHostedWindow（远程视图），
+// drawViewHierarchyInRect 在它身上取不到位图 → ① ② 都恒为 0.0%，
+// 于是无论实际透不透明都会打印「底色 100% 来自宿主 App」—— 这是个假判决。
+// 现在先单独渲染 kb 自己（有按键、必然有像素）；若连它都是 0%，就直接宣布本项作废，
+// 不再输出任何结论，避免把排查方向带偏。
 static void WTE_TransparentSelfTest(UIView *kb, NSMutableString *out) {
     if (!kb || !kb.window || !out) return;
-    double rAll = WTE_RenderOpaqueRatio(kb.window);
-    BOOL wasHidden = kb.hidden;
-    kb.hidden = YES;
-    double rBg = WTE_RenderOpaqueRatio(kb.window);
-    kb.hidden = wasHidden;
+    UIWindow *w = kb.window;
 
     [out appendString:@"\n===== 透明自检（把窗口渲染成位图数不透明像素）=====\n"];
-    if (rAll < 0 || rBg < 0) { [out appendString:@"  （渲染失败，本机不支持采样）\n"]; return; }
-    [out appendFormat:@"  ① 整个窗口原样渲染       不透明占比 %5.1f%%（按键本来就不透明，正常）\n", rAll * 100];
+    [out appendFormat:@"  取样窗口 %@ f(%.0f,%.0f,%.0f,%.0f) opaque=%d\n",
+        NSStringFromClass([w class]),
+        w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height,
+        w.opaque ? 1 : 0];
+
+    double rKey = WTE_RenderOpaqueRatio(kb);       // ⓪ 渲染器有效性对照
+    double rAll = WTE_RenderOpaqueRatio(w);
+    BOOL wasHidden = kb.hidden;
+    kb.hidden = YES;
+    double rBg = WTE_RenderOpaqueRatio(w);
+    kb.hidden = wasHidden;
+
+    if (rAll < 0 || rBg < 0 || rKey < 0) {
+        [out appendString:@"  （渲染失败，本机不支持采样）\n"];
+        return;
+    }
+    [out appendFormat:@"  ⓪ 只渲染键盘容器本身     不透明占比 %5.1f%%（渲染器有效性对照）\n", rKey * 100];
+    [out appendFormat:@"  ① 整个窗口原样渲染       不透明占比 %5.1f%%\n", rAll * 100];
     [out appendFormat:@"  ② 藏掉键盘容器后再渲染    不透明占比 %5.1f%%\n", rBg * 100];
+
+    if (rKey < 0.01) {
+        [out appendString:
+            @"  ⚠️ ⓪ 就是 0% —— 键盘明明画着字母却采不到任何像素，\n"
+            @"     说明扩展进程的 _UIHostedWindow 是【远程视图】，本地渲染拿不到位图。\n"
+            @"     本项【作废】，不要据此下结论；透明与否以「宿主 App 回执」那一段为准。\n"];
+        return;
+    }
     if (rBg < 0.02) {
         [out appendString:@"  ⇒ 判决：本进程窗口除了键盘内容【什么都没画】\n"
-                          "    剩下的底色 100% 来自宿主 App 进程 —— 看上面的「宿主回执」确认注入有没有铺开\n"];
+                          "    （如带域内确实还有底色，那只可能来自宿主 App 进程）\n"];
     } else {
         [out appendString:@"  ⇒ 判决：本进程窗口里【还有别的东西在画底色】！\n"
                           "    拿上面的「窗口列表」和「底板普查」对，找出那个大面积的层\n"];
@@ -582,6 +611,7 @@ static void WTE_DiagFlush(NSString *tag) {}
 @property (nonatomic, assign) BOOL keyboardTransparent;
 @property (nonatomic, copy)   NSString *transScope;   // bg / all
 @property (nonatomic, assign) double    keyOpacity;   // v1.9.0 按键透明度（透明底模式专用）
+@property (nonatomic, assign) BOOL      keyOpacityExplicit;  // v1.9.2：用户是否亲手拉过滑条
 
 @property (nonatomic, assign) BOOL keyColorEnabled;
 @property (nonatomic, strong) UIColor *keyLetterBg;
@@ -662,9 +692,16 @@ static void WTE_DiagFlush(NSString *tag) {}
     if (![c.transScope isEqualToString:@"bg"] && ![c.transScope isEqualToString:@"all"])
         c.transScope = @"bg";
 
-    // v1.9.0 按键透明度：1.0 = 不透明（默认，打字最清楚），0 = 完全透明。
-    // 只在透明底模式下生效，越界值一律夹回 [0,1]。
-    c.keyOpacity = WTE_DoublePref(kKeyKeyOpacity, 1.0);
+    // v1.9.0 按键透明度：1.0 = 不透明，0 = 完全透明。
+    // v1.9.2：默认从 1.0 改成 0.30 —— 1.0 意味着「滑条永远没效果」，
+    //   用户报「键盘还是实心」正是这个默认值造成的（键帽的装饰子层仍是 100% 不透明）。
+    //   0.30 = 键帽半透明，能看见聊天背景，字母照旧清晰（即用户要的「透明但不影响打字」）。
+    //   两条生效条件（见 WTE_ApplyKeyAppearance）：
+    //     · 透明范围 = 整键盘透明，或
+    //     · 用户亲手拉过滑条（keyOpacityExplicit）
+    //   这样「只透底板（按键正常，推荐）」这一档不会被默认值误伤。
+    c.keyOpacityExplicit = (WTE_GetPref(kKeyKeyOpacity) != nil);
+    c.keyOpacity = WTE_DoublePref(kKeyKeyOpacity, 0.30);
     if (!(c.keyOpacity >= 0.0)) c.keyOpacity = 0.0;
     if (c.keyOpacity > 1.0)     c.keyOpacity = 1.0;
 
@@ -886,6 +923,80 @@ static UIColor *WTE_GradientColorForLetter(unichar ch, WTEConfig *c) {
 @end
 
 #pragma mark - ========== 核心：把配置应用到单个视图 ==========
+
+// 前置声明（定义在本小节之后）：判定一个 CALayer 是不是某个视图自己的层
+static BOOL WTE_IsViewBackedLayer(CALayer *l);
+
+// ═══ v1.9.2：把「不透明度上限」封到颜色上 —— 只降不升，且可还原 ═══
+//
+// 这是「按键透明度滑动条拉了半天没反应」的根因修法。
+// 微信输入法自己的键帽底色是 white@0.18（半透明），而 v1.9.0/1.9.1 的写法是
+// **直接赋值** [UIColor colorWithWhite:1.0 alpha:keyOpacity]：
+//   · 默认 keyOpacity = 1.0 → 整段被 `keyOpacity < 0.995` 跳过，滑条完全无效
+//   · 就算拉到 0.5  → 把 0.18 抬到 0.50，反而**更不透明**，用户越拉越实
+// 现在改成「上限」语义：alpha 高于上限才压下来，否则原样保留。
+//
+// ⚠️ 还有一个必须解决的副作用：压低是【破坏性】的，滑条往回调就回不去了。
+//    所以第一次动手前先把「原始值」记在 associated object 上，
+//    之后一律用 `MIN(原始值, 上限)` 计算目标值 —— 拉回 1.0 就能完整还原。
+static const void *kWTEOrigBgColorKey = &kWTEOrigBgColorKey;   // 视图的原始底色
+static const void *kWTEOrigLayerOpKey = &kWTEOrigLayerOpKey;   // 装饰子层的原始 opacity
+
+static UIColor *WTE_ClampAlpha(UIColor *col, CGFloat cap) {
+    if (!col) return nil;
+    if (cap < 0.0) cap = 0.0;
+    if (cap > 1.0) cap = 1.0;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    @try {
+        if (![col getRed:&r green:&g blue:&b alpha:&a]) {
+            CGFloat w = 0, wa = 0;
+            if ([col getWhite:&w alpha:&wa]) { r = g = b = w; a = wa; }
+            else return col;
+        }
+    } @catch (__unused NSException *e) { return col; }
+    if (a <= cap + 0.001) return col;              // 已经够透，别动它
+    return [UIColor colorWithRed:r green:g blue:b alpha:cap];
+}
+
+// 把一个视图的底色按上限封顶；原始值只记一次，所以往回调能还原。
+static void WTE_ClampViewBackground(UIView *v, CGFloat cap) {
+    if (!v) return;
+    UIColor *cur = v.backgroundColor;
+    if (!cur) return;
+    UIColor *orig = objc_getAssociatedObject(v, kWTEOrigBgColorKey);
+    if (!orig) {
+        orig = cur;
+        objc_setAssociatedObject(v, kWTEOrigBgColorKey, orig,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UIColor *want = WTE_ClampAlpha(orig, cap);
+    if (!want || want == cur) return;
+    CGColorRef a = cur.CGColor, b = want.CGColor;
+    if (a && b && CGColorEqualToColor(a, b)) return;
+    v.backgroundColor = want;
+}
+
+// 把视图「装饰子层」（键帽底板 / 描边 / 渐变，都不在 subviews 里）压到上限。
+// cap = 0 时等于全隐身，只剩字母。同样记录原始 opacity，可还原。
+static void WTE_ClampDecorationOpacity(UIView *v, CGFloat cap) {
+    if (!v) return;
+    if (cap < 0.0) cap = 0.0;
+    if (cap > 1.0) cap = 1.0;
+    for (CALayer *sl in [v.layer.sublayers copy]) {
+        if (WTE_IsViewBackedLayer(sl)) continue;   // 视图自己的层不动（文字、图标）
+        NSNumber *stored = objc_getAssociatedObject(sl, kWTEOrigLayerOpKey);
+        float orig;
+        if (stored) {
+            orig = stored.floatValue;
+        } else {
+            orig = (float)sl.opacity;
+            objc_setAssociatedObject(sl, kWTEOrigLayerOpKey, @(orig),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        float want = MIN(orig, (float)cap);
+        if (fabsf(sl.opacity - want) > 0.001f) sl.opacity = want;
+    }
+}
 
 // 只在颜色真的变了才写。冗余写 backgroundColor 会触发重绘/重排，
 // 在 -layoutSubviews 里反复写就是「卡死」的温床。
@@ -1588,17 +1699,38 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
 static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
     WTEKeyKind kind = WTE_KeyKindForView(self);
 
-    // ★ v1.9.0：「按键透明度」滑动条 ★（只在透明底模式起作用）
-    //   1.0 = 不透明（默认 → 打字完全不受影响，也就是用户要的「透明但不影响打字」）
-    //   0.0 = 完全透明（只剩字母，透过按键能直接看到聊天背景）
-    //   与「透明范围」独立：就算选「只透底板」，把滑条拉低也能让按键透。
-    //   用户自己开了「按键配色」的话，以用户的配色为准。
-    if (!c.keyColorEnabled && c.keyOpacity < 0.995
-        && (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])) {
-        WTE_SetBackground(self, [UIColor colorWithWhite:1.0 alpha:c.keyOpacity]);
-        for (CALayer *sl in [self.layer.sublayers copy]) {
-            if (WTE_IsViewBackedLayer(sl)) continue;              // 视图自己的层不动
-            if (fabs(sl.opacity - c.keyOpacity) > 0.01) sl.opacity = (float)c.keyOpacity;
+    // ★ v1.9.0 引入 / v1.9.2 重做：「按键透明度」滑动条 ★
+    //   1.0 = 不透明（按键完全不动，打字最清楚）
+    //   ~0.3 = 半透明（默认。能看见聊天背景，字母照样清晰 → 用户要的「透明但不影响打字」）
+    //   0.0 = 完全透明（键帽一点不剩，只剩字母）
+    //   只在透明底模式生效；用户自己开了「按键配色」的话以用户的配色为准。
+    //
+    // 【v1.9.2 修的是什么】
+    //   v1.9.0/1.9.1 是**直接赋值** white@keyOpacity，有两个致命副作用：
+    //     ① 默认 1.0 时整段被 `keyOpacity < 0.995` 跳掉 → 滑条完全无效
+    //     ② 微信输入法键帽本来是 white@0.18，拉到 0.5 反而把 0.18 抬到 0.50，
+    //        越拉越实 —— 用户「怎么调都没透明」就是这么来的
+    //   现在全部改成「上限」语义（只降不升），拉滑条必然生效，且绝不会改得更实。
+    //   顺带把「切到数字区时键帽底色闪一下」也一起修了：新键在**同一次布局**里
+    //   就被封顶，不会再有一帧的实心底色漏出来。
+    if (!c.keyColorEnabled && (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])
+        && ([c.transScope isEqualToString:@"all"] || c.keyOpacityExplicit)) {
+        CGFloat cap = (CGFloat)c.keyOpacity;
+        // ① 按键自己的底色
+        WTE_ClampViewBackground(self, cap);
+        // ② 键帽的装饰子层（键帽底板 / 描边 / 渐变 —— 都画在 backgroundColor 之上，
+        //    这才是「键盘看起来还是实心」的元凶）
+        WTE_ClampDecorationOpacity(self, cap);
+        // ③ 有些键把底板画在一个铺满整键的子视图上（不是文字 / 图标）
+        for (UIView *sub in [self.subviews copy]) {
+            if ([sub isKindOfClass:[UILabel class]]) continue;
+            if ([sub isKindOfClass:[UIImageView class]]) continue;
+            if (self.bounds.size.height > 1.0 &&
+                sub.bounds.size.height < self.bounds.size.height * 0.8) continue;
+            if (self.bounds.size.width > 1.0 &&
+                sub.bounds.size.width  < self.bounds.size.width  * 0.8) continue;
+            WTE_ClampViewBackground(sub, cap);
+            WTE_ClampDecorationOpacity(sub, cap);
         }
     }
 
@@ -1675,6 +1807,13 @@ static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
 static void WTE_ApplyBarOrCandidate(UIView *self, WTEConfig *c) {
     if (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"]) {
         WTE_SetClearBackground(self);
+        // v1.9.2：候选栏（WBTopBar / WBArrangeView / WBCandidateView）的底板
+        // 也是一层层装饰子层 —— 只清 backgroundColor 会留下一条实心长条，
+        // 也就是用户截图里最显眼的那块。这里按「按键透明度」同样封顶（只降不升、可还原）。
+        if (!c.keyColorEnabled
+            && ([c.transScope isEqualToString:@"all"] || c.keyOpacityExplicit)) {
+            WTE_ClampDecorationOpacity(self, (CGFloat)c.keyOpacity);
+        }
     }
     if (c.keyColorEnabled && c.keyTextColor) {
         if ([self isKindOfClass:[UILabel class]]) ((UILabel *)self).textColor = c.keyTextColor;
@@ -2147,8 +2286,21 @@ static NSArray<NSString *> *WTE_HostBackdropClasses(void) {
     static NSArray *a = nil;
     if (!a) a = @[@"UIRemoteKeyboardWindow", @"UIInputSetContainerView",
                   @"UIInputSetHostView", @"UIKeyboardHostView",
-                  @"_UIKeyboardHostView"];
+                  @"_UIKeyboardHostView",
+                  // v1.9.2：系统给第三方键盘垫的底板还有这些名字
+                  @"UIKBBackdropView", @"_UIKBBackdropView",
+                  @"_UIBackdropView", @"_UIBackdropEffectView",
+                  @"UIKeyboardBackdropView", @"_UIKeyboardBackdropView",
+                  @"UIBackdropView", @"_UIBackgroundView"];
     return a;
+}
+
+// v1.9.2：兜底判据 —— 类名里带 Backdrop / BackdropEffect 的，都是纯装饰层
+static BOOL WTE_HostNameLooksBackdrop(NSString *cls) {
+    if (![cls isKindOfClass:[NSString class]] || cls.length == 0) return NO;
+    if ([cls containsString:@"Backdrop"]) return YES;
+    if ([cls containsString:@"Material"]) return YES;
+    return NO;
 }
 
 // —— 宿主侧「回执」——
@@ -2178,6 +2330,10 @@ static void WTE_HostAppendReport(NSString *text) {
 // 苹果原生键盘的按键平面就在进程内，一旦看到 Keyplane / KeyView 就说明是原生键盘，
 // 绝不能动它的底板，否则连原生键盘都会变透明。
 // 第三方键盘在宿主进程里只有一个远程视图外壳，不会有这些部件。
+// v1.9.2：判据收紧 —— 去掉 "KeyView" / "KeyboardDock" 这两个过宽的词。
+// 它们会把「宿主键盘窗口里恰好带这些字的辅助视图」误判成原生键盘，
+// 一旦误判，整个宿主清扫就被整支跳过（这正好能解释「加了三版宿主清扫，屏幕上一动不动」）。
+// 真正的原生键盘按键平面一定有 Keyplane / KeyCap / UIKBKey* 这些类名，够用了。
 static BOOL WTE_HostTreeLooksLikeSystemKeyboard(UIView *root) {
     if (!root) return NO;
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
@@ -2188,9 +2344,8 @@ static BOOL WTE_HostTreeLooksLikeSystemKeyboard(UIView *root) {
         [stack removeLastObject];
         for (UIView *s in v.subviews) [stack addObject:s];
         NSString *n = NSStringFromClass([v class]);
-        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyView"] ||
-            [n containsString:@"KeyboardDock"] || [n containsString:@"KeyCap"] ||
-            [n hasPrefix:@"UIKBKey"]) return YES;
+        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyCap"] ||
+            [n containsString:@"UIKBKey"]) return YES;
     }
     return NO;
 }
@@ -2225,6 +2380,85 @@ static NSArray<UIWindow *> *WTE_HostAllWindows(void) {
     } @catch (__unused NSException *e) { return @[]; }
 }
 
+// v1.9.2：这棵子树里有没有「人脸要看的内容」（文字 / 图标）？
+// 用来决定一个 backdrop 能不能直接 hidden —— 有文字图标的绝不能藏。
+static BOOL WTE_HostSubtreeHasReadable(UIView *root, int depth) {
+    if (!root || depth > 8) return NO;
+    if ([root isKindOfClass:[UILabel class]]) return YES;
+    if ([root isKindOfClass:[UIImageView class]]) return YES;
+    if ([root isKindOfClass:[UITextView class]]) return YES;
+    if ([root isKindOfClass:[UITextField class]]) return YES;
+    for (UIView *s in root.subviews) {
+        if (WTE_HostSubtreeHasReadable(s, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+// v1.9.2：宿主侧的颜色转字符串（不能复用 WTE_DiagColorRGBA —— 它在诊断块内）
+static NSString *WTE_HostColorString(UIColor *col) {
+    if (!col) return @"-";
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    @try {
+        if (![col getRed:&r green:&g blue:&b alpha:&a]) {
+            CGFloat w = 0, wa = 0;
+            if ([col getWhite:&w alpha:&wa]) { r = g = b = w; a = wa; }
+            else return @"?";
+        }
+    } @catch (__unused NSException *e) { return @"?"; }
+    return [NSString stringWithFormat:@"%.2f,%.2f,%.2f,%.2f", r, g, b, a];
+}
+
+// v1.9.2：把宿主的键盘窗口树原样拍下来，写进 host.txt。
+// 这是唯一能回答「宿主这边到底垫了什么底板」的证据：
+//   · 键盘扩展被沙盒关住，看不到宿主的容器（v1.9.0 报告已证实）
+//   · 宿主 App 只能写自己容器里的 host.txt —— 由「设置」面板去收（面板能读 App 容器）
+// 每行字段：类名 / frame / backgroundColor RGBA / alpha / isOpaque / 子视图数 /
+//          装饰子层数 / 毛玻璃 / 名字像 backdrop 的标记
+static void WTE_HostDumpWindowTree(UIView *root, NSMutableString *out, int maxLines) {
+    if (!root || !out || maxLines <= 0) return;
+    [out appendFormat:@"  ---- 宿主键盘窗口树：%@ f(%.0f,%.0f,%.0f,%.0f) 子视图=%lu ----\n",
+        NSStringFromClass([root class]),
+        root.frame.origin.x, root.frame.origin.y, root.frame.size.width, root.frame.size.height,
+        (unsigned long)root.subviews.count];
+
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    WTE_CollectViewLayers(root, viewLayers, 0);
+
+    NSMutableArray *cur = [NSMutableArray array];
+    [cur addObject:@[root, @(0)]];
+    int lines = 0, guard = 0, total = 0;
+    while (cur.count > 0 && guard < 1200) {
+        guard++;
+        NSArray *item = cur.firstObject;
+        [cur removeObjectAtIndex:0];
+        UIView *v = item[0];
+        int depth = [item[1] intValue];
+        total++;
+
+        if (lines < maxLines) {
+            lines++;
+            NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2 + 2)
+                                              withString:@" " startingAtIndex:0];
+            NSString *cls = NSStringFromClass([v class]);
+            int deco = WTE_CountDecorationSublayers(v, viewLayers);
+            BOOL effect = ([v isKindOfClass:[UIVisualEffectView class]] &&
+                           ((UIVisualEffectView *)v).effect != nil);
+            [out appendFormat:@"%@%@ f(%.0f,%.0f,%.0f,%.0f) bg(%@) al=%.2f op=%d 子=%lu 饰=%d%@%@\n",
+                pad, cls,
+                v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height,
+                WTE_HostColorString(v.backgroundColor),
+                v.alpha, v.isOpaque ? 1 : 0,
+                (unsigned long)v.subviews.count, deco,
+                effect ? @" 毛玻璃" : @"",
+                WTE_HostNameLooksBackdrop(cls) ? @" ★Backdrop名" : @""];
+        }
+        if (depth < 9) {
+            for (UIView *s in v.subviews) [cur addObject:@[s, @(depth + 1)]];
+        }
+    }
+    if (lines < total) [out appendFormat:@"  （共 %d 个节点，只打了前 %d 行）\n", total, lines];
+}
+
 // 清一棵【键盘窗口】子树里所有能画出底色的东西。
 // 这棵树整个都属于键盘，可以放心清；唯一要避开的是文字 / 图标（人手要看的）。
 // 返回清掉的视图数。
@@ -2254,6 +2488,9 @@ static int WTE_HostSweepTree(UIView *root, NSMutableString *log, int *logged) {
         for (NSString *n in WTE_HostBackdropClasses()) {
             if ([cls isEqualToString:n]) { isBackdrop = YES; break; }
         }
+        // v1.9.2：类名兜底（*Backdrop* / *Material*）
+        BOOL byName = WTE_HostNameLooksBackdrop(cls);
+        if (byName) isBackdrop = YES;
 
         CGFloat area = v.bounds.size.width * v.bounds.size.height;
         BOOL big = (rootArea > 1.0 && area >= rootArea * 0.20);
@@ -2262,17 +2499,28 @@ static int WTE_HostSweepTree(UIView *root, NSMutableString *log, int *logged) {
         BOOL needClear = isBackdrop || effect || (big && !WTE_SubtreeHasContent(v, 0));
         if (!needClear) continue;
 
+        // ① 让它画不出东西（清底色 / 内容 / 装饰层 / 滤镜 / 毛玻璃）
         WTE_ClearLayerPaint(v);
         WTE_ClearLayerFilters(v);
         WTE_StripDecorationSublayers(v, viewLayers);
         if (v.opaque) v.opaque = NO;
+        if (effect) {
+            @try { ((UIVisualEffectView *)v).effect = nil; } @catch (__unused NSException *e) {}
+        }
+        // ② drawRect: 类底色清不掉，只能整个藏掉。安全边界：
+        //    只藏「类名明确是 backdrop」的，且子树里没有任何文字 / 图标。
+        BOOL hid = NO;
+        if (byName && !v.hidden && !WTE_HostSubtreeHasReadable(v, 0)) {
+            v.hidden = YES;
+            hid = YES;
+        }
         cleared++;
         if (log && logged && *logged < 40) {
             (*logged)++;
-            [log appendFormat:@"  [host-clear] %@ f(%.0f,%.0f,%.0f,%.0f) 容器=%d 毛玻璃=%d\n",
+            [log appendFormat:@"  [host-clear] %@ f(%.0f,%.0f,%.0f,%.0f) 容器=%d 毛玻璃=%d 名判=%d 已藏=%d\n",
              cls, v.frame.origin.x, v.frame.origin.y,
              v.frame.size.width, v.frame.size.height,
-             isBackdrop ? 1 : 0, effect ? 1 : 0];
+             isBackdrop ? 1 : 0, effect ? 1 : 0, byName ? 1 : 0, hid ? 1 : 0];
         }
     }
     return cleared;
@@ -2306,7 +2554,13 @@ static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
                 continue;
             }
             touched++;
+            // v1.9.2：把键盘窗口的树结构原样拍下来。
+            // 这是唯一能回答「宿主这边到底垫了什么底板」的证据 ——
+            // 键盘扩展进程被沙盒关住，看不到宿主 App 的容器；
+            // 反过来宿主 App 只写自己容器里的 host.txt，由设置面板去收（面板能读 App 容器）。
+            if (writeLog) WTE_HostDumpWindowTree(w, log, 120);
             total += WTE_HostSweepTree(w, log, &logged);
+            if (writeLog) WTE_HostDumpWindowTree(w, log, 40);   // 清完之后再拍一小段，对照
         }
 
         if (writeLog && touched > 0) {
@@ -2361,8 +2615,8 @@ static BOOL WTE_FastLooksSystemKeyboard(UIView *root) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
         NSString *n = NSStringFromClass([v class]);
-        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyView"] ||
-            [n containsString:@"KeyboardDock"] || [n hasPrefix:@"UIKBKey"]) return YES;
+        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyCap"] ||
+            [n containsString:@"UIKBKey"]) return YES;
         int depth = (int)[stack count];   // 粗估：用队列长度近似控制层数
         if (depth > 60) continue;
         for (UIView *s in v.subviews) [stack addObject:s];
@@ -2605,7 +2859,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.9.1 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.9.2 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
@@ -2622,6 +2876,14 @@ static void WTE_Init(void) {
     WTE_Diag(@"  enabled=%d bgEnabled=%d bgMode=%@ keyColorEnabled=%d skinEnabled=%d kbOffset=%.1f",
              gConfig.enabled, gConfig.bgEnabled, gConfig.bgMode,
              gConfig.keyColorEnabled, gConfig.skinEnabled, gConfig.kbOffset);
+    // v1.9.2：把透明相关的三项单独打出来 —— 「没透明」到底是配置没读到，
+    // 还是代码没生效，看这一行就够了。
+    WTE_Diag(@"  透明: transScope=%@ keyboardTransparent=%d 按键透明度=%.2f(滑动条%@生效)",
+             gConfig.transScope ?: @"?",
+             gConfig.keyboardTransparent,
+             gConfig.keyOpacity,
+             ([gConfig.transScope isEqualToString:@"all"] || gConfig.keyOpacityExplicit)
+                 ? @"已" : @"未");
 
     // 立刻写一次：证明本进程确实注入了（不依赖 hook 成功）
     WTE_DiagFlush(@"init");

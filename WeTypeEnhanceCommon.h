@@ -26,10 +26,13 @@
 #define kKeyBgAlpha            @"bgAlpha"
 #define kKeyBgImageData        @"bgImageData"
 #define kKeyKeyboardTransparent @"keyboardTransparent"
-// v1.8.7：透明底的范围  bg = 只透底板（按键保留原样） / all = 整键盘透明（按键帽也摘掉）
+// v1.8.7：透明底的范围  bg = 只透底板（按键保留原样） / all = 整键盘透明（按键帽按下面的滑条变透）
 #define kKeyTransScope         @"transScope"
-// v1.9.0：按键透明度滑动条（只在透明底模式起作用）
-//   1.0 = 不透明（默认，打字最清楚）；0.0 = 完全透明（只剩字母）
+// v1.9.0 引入 / v1.9.2 修好：按键透明度滑动条（只在透明底模式起作用）
+//   1.0 = 不透明；0.3 = 默认，键帽半透明但字母清晰；0.0 = 完全透明（只剩字母）
+//   ⚠️ v1.9.2 语义变更：从「直接赋值」改成「封顶」（只降不升）——
+//      之前默认 1.0 导致整段被跳过（滑条完全无效），拉到 0.5 还会把键帽的
+//      原生 0.18 抬到 0.50（越拉越实）。现在 alpha 只会被压低，拉滑条必然生效。
 #define kKeyKeyOpacity         @"keyOpacity"
 
 // 2. 按键配色
