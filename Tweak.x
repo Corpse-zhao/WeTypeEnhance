@@ -1280,8 +1280,8 @@ static void WTE_ClearAllExtensionWindows(UIView *kb) {
         WTE_StripDecorationSublayers(w, viewLayers);
         if (w.opaque) w.opaque = NO;
         touched++;
-        WTE_Diag(@"[allwin] 额外窗口 %@ f(%0.f,%0.f,%0.f,%0.f) 子视图=%lu 已清",
-                 NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y,
+        WTE_Diag(@"[allwin] 额外窗口#%d %@ f(%0.f,%0.f,%0.f,%0.f) 子视图=%lu 已清",
+                 touched, NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y,
                  w.frame.size.width, w.frame.size.height, (unsigned long)w.subviews.count);
 
         CGFloat area = w.bounds.size.width * w.bounds.size.height;
