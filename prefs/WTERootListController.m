@@ -5,6 +5,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <sys/sysctl.h>
+#import <signal.h>
 #import "../WeTypeEnhanceCommon.h"
 
 // ---- Preferences 私有框架自声明 ----
@@ -299,8 +301,25 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     // 版本号从 bundle 读，避免写死后与实际包版本不一致
     NSString *ver = [[NSBundle bundleForClass:[self class]]
                      objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
-    [specs addObject:[self group:[NSString stringWithFormat:
-        @"微信输入法增强 v%@\n功能对等移植自「原生输入法增强」", ver]]];
+
+    // ★ 版本一致性检查：iOS 装 deb 不重启键盘扩展进程，
+    //   面板是新版、键盘还是旧码 —— 这是「改了设置完全不生效」的头号原因。
+    NSString *running = [self keyboardRunningVersion];
+    NSString *head;
+    if (running.length && ![running isEqualToString:ver]) {
+        head = [NSString stringWithFormat:
+            @"微信输入法增强 v%@\n\n⚠️ 键盘进程还在跑旧版 v%@\n装完新包必须注销一次，否则怎么调都不生效", ver, running];
+    } else if (running.length) {
+        head = [NSString stringWithFormat:
+            @"微信输入法增强 v%@\n键盘进程 v%@ ✅ 版本一致", ver, running];
+    } else {
+        head = [NSString stringWithFormat:
+            @"微信输入法增强 v%@\n功能对等移植自「原生输入法增强」\n（还没拿到键盘进程报告，弹出一次键盘后再看）", ver];
+    }
+    [specs addObject:[self group:head]];
+    [specs addObject:[self buttonRow:@"重启键盘进程（不影响其它 App）" action:@selector(restartKeyboard:)]];
+    [specs addObject:[self buttonRow:@"检查键盘运行版本" action:@selector(checkKeyboardVersion:)]];
+    [specs addObject:[self buttonRow:@"注销 (Respring)" action:@selector(respringDevice:)]];
     [specs addObject:[self switchRow:@"启用" key:kKeyEnabled def:YES]];
 
     // ---- 1. 键盘背景（v1.8.0：只保留 纯色 / 透明底） ----
@@ -490,9 +509,139 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     // no-op
 }
 
+#pragma mark - 只重启键盘进程（不动其它 App）
+
+// 枚举进程表，把微信输入法的键盘扩展进程（wxkb_plugin）杀掉。
+// 面板和键盘扩展都以 mobile 身份运行，同 uid 之间 kill 是允许的。
+// 杀掉之后系统会在下次弹出键盘时自动用新 dylib 重新拉起 —— 不用注销、不动别的 App。
+// ⚠️ 只匹配 wxkb 前缀，绝不碰主 App（否则会把微信一起干掉）。
+static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
+    int killed = 0;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) return 0;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
+    if (!procs) return 0;
+    if (sysctl(mib, 4, procs, &size, NULL, 0) != 0) { free(procs); return 0; }
+
+    int n = (int)(size / sizeof(struct kinfo_proc));
+    pid_t me = getpid();
+    for (int i = 0; i < n; i++) {
+        pid_t pid = procs[i].kp_proc.p_pid;
+        if (pid <= 0 || pid == me) continue;
+        char nm[32] = {0};
+        strncpy(nm, procs[i].kp_proc.p_comm, sizeof(nm) - 1);
+        if (nm[0] == 0) continue;
+        NSString *pn = [NSString stringWithUTF8String:nm];
+        if (![pn.lowercaseString containsString:@"wxkb"]) continue;
+        if (kill(pid, SIGKILL) == 0) {
+            killed++;
+            if (report) [report addObject:[NSString stringWithFormat:@"%@ (pid %d)", pn, pid]];
+        }
+    }
+    free(procs);
+    return killed;
+}
+
+- (void)restartKeyboard:(PSSpecifier *)spec {
+    NSMutableArray *killedList = [NSMutableArray array];
+    int n = WTE_KillKeyboardWebProcesses(killedList);
+    NSString *mine = [self myVersion];
+
+    NSString *msg;
+    if (n > 0) {
+        NSMutableString *d = [NSMutableString string];
+        for (NSString *s in killedList) [d appendFormat:@"  %@\n", s];
+        msg = [NSString stringWithFormat:
+               @"已重启 %d 个键盘进程：\n%@\n"
+                "下一次弹出键盘时系统会用 v%@ 重新加载。\n\n"
+                "其它 App 完全没受影响，不需要注销。",
+               n, d, mine];
+    } else {
+        msg = @"当前没有正在运行的键盘进程（或者杀不掉）。\n\n"
+               "这其实也是好消息 —— 下次弹出键盘自然就是新版。\n"
+               "如果还是不生效，点「检查键盘运行版本」看看键盘跑的到底是哪个版本。";
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"重启键盘进程"
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark - 版本一致性 / 注销
+
+// 从诊断报告的 banner 行解析出键盘进程实际运行的版本号
+- (NSString *)keyboardRunningVersion {
+    NSString *path = WTEP_FindDiagPath();
+    if (!path) return nil;
+    NSString *s = [NSString stringWithContentsOfFile:path
+                                            encoding:NSUTF8StringEncoding
+                                               error:nil];
+    if (s.length == 0) return nil;
+    NSRange r = [s rangeOfString:@"WeTypeEnhance v"];
+    if (r.location == NSNotFound || r.location + r.length >= s.length) return nil;
+    NSMutableString *v = [NSMutableString string];
+    for (NSUInteger i = r.location + r.length; i < s.length; i++) {
+        unichar ch = [s characterAtIndex:i];
+        if ((ch >= '0' && ch <= '9') || ch == '.') [v appendFormat:@"%C", ch];
+        else break;
+    }
+    return v.length ? v : nil;
+}
+
+- (NSString *)myVersion {
+    return [[NSBundle bundleForClass:[self class]]
+            objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+}
+
+- (void)checkKeyboardVersion:(PSSpecifier *)spec {
+    NSString *mine = [self myVersion];
+    NSString *running = [self keyboardRunningVersion];
+    NSString *msg;
+    if (!running) {
+        msg = @"没拿到键盘进程的诊断报告。\n\n"
+               "先弹一次微信输入法键盘，再回来点这个按钮。";
+    } else if ([running isEqualToString:mine]) {
+        msg = [NSString stringWithFormat:
+               @"键盘进程正在运行 v%@\n面板也是 v%@\n\n✅ 版本一致，设置可以直接生效。", running, mine];
+    } else {
+        msg = [NSString stringWithFormat:
+               @"⚠️ 键盘进程还在跑旧版 v%@\n面板已经是 v%@\n\n"
+                "iOS 装 deb 只换磁盘文件，【不会】重启正在运行的键盘扩展进程。\n"
+                "所以面板是新的、键盘还是旧代码 —— 怎么调都不会生效。\n\n"
+                "→ 点下面的「注销 (Respring)」按钮，注销完再测。",
+               running, mine];
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"键盘运行版本"
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)respringDevice:(PSSpecifier *)spec {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"注销"
+                                                              message:@"将重启 SpringBoard（屏幕会黑几秒），确定吗？"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"注销" style:UIAlertActionStyleDestructive
+                                        handler:^(__unused UIAlertAction *act) {
+        // 老牌做法：给 SpringBoard 发「重启渲染树」的 Darwin 通知（roothide 上通常仍有效）
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFSTR("SBRestartRenderTree"), NULL, NULL, TRUE);
+        // 兜底：1 秒后再发一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                                 CFSTR("SBRestartRenderTree"), NULL, NULL, TRUE);
+        });
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
 // 手动把配置刷一遍到所有可读位置（键盘扩展容器 / Media / App Group）
-// 用于「改了设置但键盘没反应」时手工重推一次，并直接看到写成功了几处。
-- (void)syncToKeyboard:(PSSpecifier *)spec {
+// 用于「改了设置但键盘没反应」时手工重推一次，并直接看到写成功了几处。- (void)syncToKeyboard:(PSSpecifier *)spec {
     NSArray *ok = WTE_SyncConfigToReadablePlaces();
     NSMutableString *detail = [NSMutableString string];
     NSUInteger shown = 0;
