@@ -10,17 +10,22 @@
 <dict>
     <key>Filter</key>
     <dict>
-        <!-- v1.8.8：宿主 App 侧清扫 —— 必须把插件也注入到「会弹键盘的宿主 App」。
+        <!-- v1.9.1：把宿主 App 覆盖面一次性铺开。
              第三方键盘真正的显示位置在宿主 App 进程里：
                  UIRemoteKeyboardWindow → UIInputSetContainerView → UIInputSetHostView
-             系统在那几级容器上垫的键盘底板，扩展进程无论怎么清都碰不到
-             （v1.8.7 的底板普查为空就是铁证）。所以这里把常用的宿主 App 都列上。
+             系统在那几级容器上垫的键盘底板，扩展进程无论怎么清都碰不到。
 
-             ⚠️ 刻意【不】用 Classes/Mode 这种「按类名全量注入」的写法：
-                roothide 的注入层对过滤键的默认语义与 libhooker 未必完全一致，
-                万一 Mode 默认是 All（与），一个类名没匹配上就会让整个插件
-                在所有进程都不注入 —— 代价太大。Bundles 是已被证明可用的写法，
-                先保证「一定注入」，覆盖面后面再扩。 -->
+             Classes = UIInputSetHostView：这是「会弹键盘的宿主」的精确特征。
+             关键点：它是 UIKitCore 里的一个**类**，任何链接了 UIKit 的进程
+             （包括键盘扩展自己）都注册了它 —— 过滤器判的是「类存在」不是「实例存在」。
+             所以：
+               · 若 Mode 默认/显式是 Any（或）→ Bundles 命中 或 Classes 命中即注入，
+                 等于「所有能弹键盘的 App」都注入，不用穷举包名；
+               · 就算某个实现把 Mode 当 All（与）→ 交集恰好还是 Bundles 那一批，
+                 行为与 v1.8.8 完全一致，**不会变得更差**。
+             两种语义下键盘扩展本身都一定被注入，安全。 -->
+        <key>Mode</key>
+        <string>Any</string>
         <key>Bundles</key>
         <array>
             <!-- 键盘扩展本体：主体逻辑在这里 -->
@@ -47,6 +52,10 @@
             <string>com.xingin.discover</string>
             <string>com.sina.weibo</string>
             <string>com.google.chrome.ios</string>
+        </array>
+        <key>Classes</key>
+        <array>
+            <string>UIInputSetHostView</string>
         </array>
         <key>Executables</key>
         <array>

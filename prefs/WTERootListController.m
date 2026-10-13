@@ -397,6 +397,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     [specs addObject:[self buttonRow:@"sunset 日落"    action:@selector(applySunset:)]];
     // ---- 8. 诊断 ----
     [specs addObject:[self group:@"诊断"]];
+    [specs addObject:[self buttonRow:@"透明诊断（点一下看结论）" action:@selector(transVerdict:)]];
     [specs addObject:[self buttonRow:@"生成诊断报告" action:@selector(openDiagReport:)]];
     [specs addObject:[self buttonRow:@"同步配置到键盘" action:@selector(syncToKeyboard:)]];
     [specs addObject:[self group:@""]];
@@ -749,8 +750,76 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
 }
 
 
-- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {
-    if (!self.pendingSpec) return;
+// ═══ v1.9.1：一句话结论 ═══
+// 用户不用导出/发文件，点一下就能看到「透明到底卡在哪一步」的结论。
+// 只挑关键行（透明自检的判决 / 宿主回执 / 当前配置 / 清了什么），弹窗直接看。
+- (void)transVerdict:(PSSpecifier *)spec {
+    NSString *path = WTEP_FindDiagPath();
+    if (!path) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没有键盘进程报告"
+            message:@"先注销一次 + 点「重启键盘进程」，然后在微信里弹一次键盘，再回来点这里。"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    NSString *content = [NSString stringWithContentsOfFile:path
+                                                  encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSArray *l1 = @[@"占比", @"判决", @"⇒"];                       // 透明自检
+    NSArray *l2 = @[@"注入成功", @"[host", @"宿主回执"];             // 宿主侧
+    NSArray *l3 = @[@"当前配置", @"装饰层：摘掉", @"藏掉", @"[allwin]",
+                    @"已成功写入", @"最终采用的来源"];
+
+    NSMutableArray *all = [NSMutableArray array];
+    for (NSString *line in [content componentsSeparatedByString:@"\n"]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length == 0) continue;
+        [all addObject:t];
+    }
+    NSMutableArray *p1 = [NSMutableArray array], *p2 = [NSMutableArray array], *p3 = [NSMutableArray array];
+    for (NSString *t in all) {
+        BOOL hit = NO;
+        for (NSString *k in l1) if ([t containsString:k]) { [p1 addObject:t]; hit = YES; break; }
+        if (hit) continue;
+        for (NSString *k in l2) if ([t containsString:k]) { [p2 addObject:t]; hit = YES; break; }
+        if (hit) continue;
+        for (NSString *k in l3) if ([t containsString:k]) { [p3 addObject:t]; break; }
+    }
+    // 每类只留最后几条（= 最近一次运行）
+    NSArray *s1 = p1.count > 8 ? [p1 subarrayWithRange:NSMakeRange(p1.count - 8, 8)] : p1;
+    NSArray *s2 = p2.count > 6 ? [p2 subarrayWithRange:NSMakeRange(p2.count - 6, 6)] : p2;
+    NSArray *s3 = p3.count > 5 ? [p3 subarrayWithRange:NSMakeRange(p3.count - 5, 5)] : p3;
+
+    NSMutableString *msg = [NSMutableString string];
+    [msg appendString:@"── 透明自检（关键）──\n"];
+    [msg appendString:s1.count ? [s1 componentsJoinedByString:@"\n"] : @"（没有：键盘进程可能没跑新版）\n"];
+    [msg appendString:@"\n── 宿主 App 侧 ──\n"];
+    [msg appendString:s2.count ? [s2 componentsJoinedByString:@"\n"] : @"（没有：宿主 App 没被注入）\n"];
+    [msg appendString:@"\n── 清理动作 ──\n"];
+    [msg appendString:s3.count ? [s3 componentsJoinedByString:@"\n"] : @"（没有）\n"];
+
+    NSString *verdict = @"";
+    for (NSString *t in s1) {
+        if ([t containsString:@"占比"] && [t containsString:@"②"]) verdict = t;
+    }
+    NSString *title = verdict.length ? @"透明结论（见正文②）" : @"透明诊断";
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"复制全文" style:UIAlertActionStyleDefault
+                                       handler:^(__unused UIAlertAction *act) {
+        [UIPasteboard generalPasteboard].string = msg;
+        __strong typeof(weakSelf) s = weakSelf;
+        if (s) [s dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc {    if (!self.pendingSpec) return;
     NSString *hex = WTE_HexFromColor(vc.selectedColor);
     [self.pendingSpec setProperty:hex forKey:@"hexValue"];
     WTE_SetPref([self.pendingSpec propertyForKey:@"key"], hex);

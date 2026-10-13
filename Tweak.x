@@ -1297,6 +1297,41 @@ static void WTE_ClearAllExtensionWindows(UIView *kb) {
     }
 }
 
+// ═══════════ v1.9.1：把两趟重活挪出布局热路径 ═══════════
+//
+// 【卡顿根因】v1.9.0 把 WTE_HidePureBackdropLeaves（窗口树遍历 ≤3000 节点）
+// 和 WTE_ClearAllExtensionWindows（所有窗口 + 收集全部视图层）直接写在
+// WTE_ApplyKeyboardBg 里。而这个函数会被 -layoutSubviews hook 在
+// 「尺寸变了」时调用 —— 键盘滑入滑出 / 切换字母↔数字 / 候选栏伸缩，
+// 每帧尺寸都在变 → 每帧走两趟全树 → 打字明显发涩。
+//
+// v1.9.1：**布局里一次重活都不做**。改成丢到主队列、延迟 0.35s、并且
+// 1.2 秒内只允许跑一次。代价是「藏叶子」比之前晚 0.35s，肉眼无感。
+static NSTimeInterval gWTELastHeavySweep = 0;
+
+static void WTE_RunHeavySweep(UIView *kb) {
+    if (!kb) return;
+    WTEConfig *c = gConfig;
+    if (!c) return;
+    if (!(c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])) return;
+    // 布局后 0.35s 再动手：这时候 UIKit 已经把这一轮的底色铺完了
+    WTE_HidePureBackdropLeaves(kb);
+    WTE_ClearAllExtensionWindows(kb);
+}
+
+static void WTE_ScheduleHeavySweep(UIView *kb) {
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - gWTELastHeavySweep < 1.2) return;      // 节流：1.2 秒最多一趟
+    gWTELastHeavySweep = now;
+    __weak UIView *weakKB = kb;
+    for (NSNumber *d in @[@0.35, @1.20]) {           // 两个时间点足够覆盖键盘建树过程
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WTE_RunHeavySweep(weakKB);
+        });
+    }
+}
+
 // ★★ v1.8.6 主枪口：键盘容器【自己图层】上的装饰子层 ★★
 //
 // 底板普查（v1.8.5 加的那个）给出的判决性证据：
@@ -1519,11 +1554,11 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
         //   所以必须顺着祖先链往上清，否则永远透不出去。
         WTE_ClearKeyboardAncestors(self);
 
-        // ★ v1.8.9：drawRect: 类底色的最后一枪 —— 整个藏掉
-        WTE_HidePureBackdropLeaves(self);
-
-        // ★ v1.9.0：本进程其它窗口也一并清掉（防「第二个窗口垫底色」）
-        WTE_ClearAllExtensionWindows(self);
+        // ★ v1.8.9/v1.9.0 的「藏叶子 / 全窗口清理」是两趟全树遍历 ——
+        //   ⚠️ v1.9.0 把它们直接写在布局路径里，键盘一滑动、尺寸一变就会被调用，
+        //      每帧走几千个节点 → 用户实测「打字不顺畅」。v1.9.1 改成
+        //      **挪出布局 + 时间节流**，布局里一次都不做重活。
+        WTE_ScheduleHeavySweep(self);
 
         // ★ v1.8.5：UIInputView 的系统键盘背景（backgroundEffects / inputViewStyle）
         //   这一项不是视图，视图树快照看不到，是「全清了还有底色」的头号嫌疑。
@@ -2100,12 +2135,13 @@ static void WTE_RelayNotifyCallback(CFNotificationCenterRef center, void *observ
 // 键盘一弹出来就在【宿主进程】里把键盘窗口那一支清干净。
 //
 // 三条纪律：
-//   · 绝不 hook 任何 layoutSubviews —— 宿主 App 里挂布局 hook 一旦形成布局反馈
-//     死循环，就是「微信整个卡死」，代价太大。只靠「键盘将要弹出 / 已经弹出」
-//     通知 + 延迟几个时间点动手；通知驱动的写字操作不会自我触发，零死循环风险。
+//   · 【v1.9.1 修订】只 hook **UIInputSetHostView 这个系统类自己实现的方法**
+//     （layoutSubviews / didMoveToWindow），而且钩子里只碰它自己那一层。
+//     绝不 hook App 的视图、也绝不 hook 我们的键盘视图 —— 不会形成布局反馈死循环。
+//     （v1.8.8 时因为怕死循环而完全不加钩子，结果清扫全靠固定时间点，容易漏。）
 //   · 只在【键盘窗口】那一支里动手（树里找不到 UIInputSetHostView 的窗口一律跳过），
 //     绝不扫 App 自己的界面 —— 不可能把用户的 App 搞透明。
-//   · 一旦在键盘窗口里看到原生键盘的自绘部件（Keyplane / KeyView / KeyboardDock）
+//   · 一旦看到原生键盘的自绘部件（Keyplane / KeyView / KeyboardDock）
 //     就整体跳过 —— 密码框等场景 iOS 会强制切回原生键盘，绝不能把原生键盘也弄透明。
 static NSArray<NSString *> *WTE_HostBackdropClasses(void) {
     static NSArray *a = nil;
@@ -2303,6 +2339,111 @@ static void WTE_HostScheduleSweeps(void) {
     }
 }
 
+// ═══ v1.9.1：宿主侧「落地钩子」═══
+//
+// 通知驱动的清扫有个天然缺陷：时间点全押在固定时刻（0.05~2.8s）。
+// 只要 UIKit 在 2.8s 之后才补一次底板，就漏了 —— 而「偶尔漏」是最难查的。
+// 这里给 UIInputSetHostView 挂两个**极窄**的钩子（只在它自己这个类上）：
+//   · -layoutSubviews   → 它一被重新布局，就把自己那一层重新清一次（极轻，只碰它自己）
+//   · -didMoveToWindow  → 进/出窗口时补几次延迟清理
+// 与「不 hook 布局」的纪律不冲突：这里 hook 的是**系统键盘容器类自己**，
+// 不是 App 的视图，也不 hook 我们的键盘视图 —— 不会形成布局反馈死循环。
+// ⚠️ 刻意【不】接管 setBackgroundColor:：那等于改掉 UIKit 的行为，
+//    连原生键盘都可能受影响，风险不值得。
+static BOOL WTE_FastLooksSystemKeyboard(UIView *root) {
+    // 浅层扫描（≤3 层、≤60 个节点）：原生键盘的按键平面就在很浅的位置，
+    // 这个判据够用而且便宜到可以放进 layoutSubviews。
+    if (!root) return NO;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard < 60) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        NSString *n = NSStringFromClass([v class]);
+        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyView"] ||
+            [n containsString:@"KeyboardDock"] || [n hasPrefix:@"UIKBKey"]) return YES;
+        int depth = (int)[stack count];   // 粗估：用队列长度近似控制层数
+        if (depth > 60) continue;
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    return NO;
+}
+
+static void (*gOrigISHLayout)(id, SEL) = NULL;
+static void (*gOrigISHDidMove)(id, SEL) = NULL;
+
+// 极轻：只碰 UIInputSetHostView 自己那一层
+static void WTE_ISH_ClearSelfLayer(UIView *v) {
+    if (!v) return;
+    @try {
+        CGColorRef cg = v.backgroundColor.CGColor;
+        if (!cg || CGColorGetAlpha(cg) > 0.001) v.backgroundColor = [UIColor clearColor];
+        if (v.opaque) v.opaque = NO;
+        @try {
+            id bf = [v.layer valueForKey:@"backgroundFilters"];
+            if ([bf isKindOfClass:[NSArray class]] && [(NSArray *)bf count] > 0)
+                [v.layer setValue:nil forKey:@"backgroundFilters"];
+        } @catch (__unused NSException *e) {}
+        @try {
+            id f = [v.layer valueForKey:@"filters"];
+            if ([f isKindOfClass:[NSArray class]] && [(NSArray *)f count] > 0)
+                [v.layer setValue:nil forKey:@"filters"];
+        } @catch (__unused NSException *e) {}
+    } @catch (__unused NSException *e) {}
+}
+
+static void WTE_ISHLayoutReplacement(id self, SEL _cmd) {
+    if (gOrigISHLayout) gOrigISHLayout(self, _cmd);
+    UIView *v = (UIView *)self;
+    if (v.hidden || v.alpha < 0.05) return;
+    @try {
+        if (WTE_FastLooksSystemKeyboard(v)) return;    // 原生键盘 → 一根手指都不碰
+        WTE_ISH_ClearSelfLayer(v);
+    } @catch (__unused NSException *e) {}
+}
+
+static void WTE_ISHDidMoveReplacement(id self, SEL _cmd) {
+    if (gOrigISHDidMove) gOrigISHDidMove(self, _cmd);
+    UIView *v = (UIView *)self;
+    if (!v.window) return;
+    @try {
+        if (WTE_FastLooksSystemKeyboard(v)) return;
+    } @catch (__unused NSException *e) {}
+    __weak UIView *weakV = v;
+    for (NSNumber *d in @[@0.02, @0.20, @0.60, @1.30]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIView *x = weakV;
+            if (!x) return;
+            @try {
+                if (WTE_FastLooksSystemKeyboard(x)) return;
+                WTE_ISH_ClearSelfLayer(x);
+            } @catch (__unused NSException *e) {}
+        });
+    }
+}
+
+// 只 hook 到「UIInputSetHostView 自己实现的方法」上。
+// ⚠️ 这一点极其重要：MSHookMessageEx 打在父类的实现上会波及**全 App 的所有视图**，
+//    所以先用 WTE_ClassImplements 确认它自己实现了，否则宁可不装。
+static int WTE_InstallHostInputSetHook(void) {
+    Class cls = NSClassFromString(@"UIInputSetHostView");
+    if (!cls) return 0;
+    int n = 0;
+    SEL s1 = @selector(layoutSubviews);
+    if (WTE_ClassImplements(cls, s1)) {
+        MSHookMessageEx(cls, s1, (IMP)&WTE_ISHLayoutReplacement, (IMP *)&gOrigISHLayout);
+        n++;
+    }
+    SEL s2 = @selector(didMoveToWindow);
+    if (WTE_ClassImplements(cls, s2)) {
+        MSHookMessageEx(cls, s2, (IMP)&WTE_ISHDidMoveReplacement, (IMP *)&gOrigISHDidMove);
+        n++;
+    }
+    return n;
+}
+
 static void WTE_InstallHostKeyboardSweep(void) {
     @try {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -2314,17 +2455,19 @@ static void WTE_InstallHostKeyboardSweep(void) {
                 WTE_HostScheduleSweeps();
             }];
         }
+        int hooked = WTE_InstallHostInputSetHook();
         // 回执：证明本进程确实被注入了，并记下进程里有没有键盘容器类。
         // 拿不到任何回执 ⇒ 过滤规则没把宿主 App 注入到，问题在下发层不在代码。
         WTE_HostAppendReport([NSString stringWithFormat:
-            @"[host] 注入成功 bundle=%@ exec=%@ pid=%d 有键盘容器类=%d time=%@\n",
+            @"[host] 注入成功 bundle=%@ exec=%@ pid=%d 有键盘容器类=%d 布局钩子=%d time=%@\n",
             [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
             [[NSProcessInfo processInfo] processName] ?: @"?",
             getpid(),
             (NSClassFromString(@"UIInputSetHostView") ? 1 : 0),
+            hooked,
             [NSDate date]]);
-        NSLog(@"[WeTypeEnhance][host] 宿主侧键盘背景清理已就绪 (%@)",
-              [[NSBundle mainBundle] bundleIdentifier]);
+        NSLog(@"[WeTypeEnhance][host] 宿主侧键盘背景清理已就绪 (%@) 钩子=%d",
+              [[NSBundle mainBundle] bundleIdentifier], hooked);
     } @catch (__unused NSException *e) {}
 }
 
@@ -2462,7 +2605,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.9.0 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.9.1 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
