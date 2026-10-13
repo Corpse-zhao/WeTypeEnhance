@@ -819,12 +819,25 @@ static UILabel *WTE_LabelOfView(UIView *v) {
 
 // 类名特征分流：这是不是「按键」/「键盘容器」/「候选栏」/「工具栏」
 static BOOL WTE_NameIsKey(NSString *cls) {
-    if ([cls containsString:@"Keyboard"]) return NO;   // 排除容器
+    // ⚠️ v1.9.2：必须先判 "KeyView" 再判 "Keyboard"。
+    //   WBSecKeyboardKeyView（数字/符号区的按键）名字里同时含 "Keyboard" 和 "Key"，
+    //   老顺序下它被当成【容器】而不是按键：
+    //     · 按键外观（配色/形状/透明度）一律不生效 —— 只有它不吃设置
+    //     · 子树以 protectedZone=NO 继续下钻 → 里面的 WBLabel / UIImageView 被
+    //       WTE_ClearLayerPaint 清掉（UIImageView 的 image 会被置 nil！）→ 图标消失
+    //   这正是「切到数字区时按钮底色闪一下才消失 / 图标发虚」的来源。
+    if ([cls containsString:@"KeyView"]) return YES;   // WBKeyView / WBRuleKeyView /
+                                                       // WBSecKeyboardKeyView / WBReturnKeyView …
+    if ([cls containsString:@"Keyboard"]) return NO;   // 容器
     if ([cls containsString:@"Key"])     return YES;
     if ([cls containsString:@"Button"] && [cls containsString:@"KB"]) return YES;
     return NO;
 }
 static BOOL WTE_NameIsKeyboard(NSString *cls) {
+    // v1.9.2：按键优先 —— 名字里带 KeyView 的一律是按键，不是键盘容器。
+    // 否则 WBSecKeyboardKeyView 会被 'Keyboard' 这条规则抢先命中，
+    // 走进容器分支（WTE_ApplyKeyboardBg），按键外观永远不被应用。
+    if ([cls containsString:@"KeyView"]) return NO;
     if ([cls containsString:@"Keyboard"]) return YES;
     if ([cls containsString:@"InputView"]) return YES;
     if ([cls containsString:@"RootInput"]) return YES;
