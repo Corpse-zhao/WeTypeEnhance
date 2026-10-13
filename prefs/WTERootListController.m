@@ -641,7 +641,8 @@ static int WTE_KillKeyboardWebProcesses(NSMutableArray *report) {
 }
 
 // 手动把配置刷一遍到所有可读位置（键盘扩展容器 / Media / App Group）
-// 用于「改了设置但键盘没反应」时手工重推一次，并直接看到写成功了几处。- (void)syncToKeyboard:(PSSpecifier *)spec {
+// 用于「改了设置但键盘没反应」时手工重推一次，并直接看到写成功了几处。
+- (void)syncToKeyboard:(PSSpecifier *)spec {
     NSArray *ok = WTE_SyncConfigToReadablePlaces();
     NSMutableString *detail = [NSMutableString string];
     NSUInteger shown = 0;
