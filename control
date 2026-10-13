@@ -1,6 +1,6 @@
 Package: com.colorblack.wetypeenhance
 Name: 微信输入法增强
-Version: 1.7.1
+Version: 1.7.2
 Architecture: iphoneos-arm64e
 Description: 微信输入法增强（按键背景/整键盘透明/按键配色/皮肤/字母渐变/按键形状/工具栏布局/键盘位移）
 Maintainer: colorblack

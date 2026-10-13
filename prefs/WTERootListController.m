@@ -4,6 +4,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <PhotosUI/PhotosUI.h>
 #import "../WeTypeEnhanceCommon.h"
 
@@ -261,35 +262,35 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 
 - (PSSpecifier *)choiceRow:(NSString *)title key:(NSString *)key def:(NSString *)def
                     values:(NSArray *)values titles:(NSArray *)titles {
-    // 点击循环切换：PSButtonCell + get 返回当前中文标题。
-    // 不用 PSLinkListCell（无 detail 控制器时点击无响应）。
+    // 用 PSTitleValueCell（和颜色行同一套，实测不会变成可编辑文本框）。
+    // 注意不能用 PSButtonCell —— 这版 Preferences 会把它渲染成可输入的文本框。
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
                                                        set:@selector(setChoiceValue:forSpecifier:)
                                                        get:@selector(getChoiceValueForSpecifier:)
                                                     detail:nil
-                                                      cell:PSButtonCell
+                                                      cell:PSTitleValueCell
                                                       edit:nil];
     [s setProperty:key forKey:@"key"];
     [s setProperty:def forKey:@"defaultValue"];
     [s setProperty:values forKey:@"validValues"];
     [s setProperty:titles forKey:@"validTitles"];
     [s setProperty:@YES forKey:@"isChoiceRow"];
-    [s setButtonAction:@selector(cycleChoice:)];
     return s;
 }
 
 - (PSSpecifier *)buttonRow:(NSString *)title action:(SEL)action {
-    // 按钮行也要给 get/set，否则整行灰掉
+    // 同上：PSButtonCell 会被当文本框，改用 PSTitleValueCell + 自定义点击。
+    // get/set 必须给（否则整行灰掉），get 返回空串让右侧留白。
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
                                                        set:@selector(setDisplay:forSpecifier:)
                                                        get:@selector(getDisplayForSpecifier:)
                                                     detail:nil
-                                                      cell:PSButtonCell
+                                                      cell:PSTitleValueCell
                                                       edit:nil];
     [s setProperty:NSStringFromSelector(action) forKey:@"action"];
-    [s setButtonAction:action];
+    [s setProperty:@YES forKey:@"isButtonRow"];
     return s;
 }
 
@@ -420,6 +421,19 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
         [tableView deselectRowAtIndexPath:indexPath animated:YES];
         return;
     }
+    if ([[spec propertyForKey:@"isButtonRow"] boolValue]) {
+        // 按钮行：自己派发动作（PSButtonCell 在这版 Preferences 会变成文本框，故手动接管）
+        NSString *selName = [spec propertyForKey:@"action"];
+        if (selName.length) {
+            SEL a = NSSelectorFromString(selName);
+            if ([self respondsToSelector:a]) {
+                // suppress performSelector-leaks warning
+                ((void (*)(id, SEL, id))objc_msgSend)(self, a, spec);
+            }
+        }
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        return;
+    }
     [super tableView:tableView didSelectRowAtIndexPath:indexPath];
 }
 
@@ -473,7 +487,7 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 
 // 按钮行的占位读写（Preferences 要求 get/set 可调用，否则整行灰掉）
 - (id)getDisplayForSpecifier:(PSSpecifier *)spec {
-    return [spec propertyForKey:@"title"] ?: @"";
+    return @"";   // PSTitleValueCell 右侧留白，标题已经写在左边
 }
 - (void)setDisplay:(id)value forSpecifier:(PSSpecifier *)spec {
     // no-op
@@ -630,11 +644,12 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
             }
             WTE_SetPref(kKeyBgMode, @"image");
             WTE_SetPref(kKeyBgEnabled, @YES);
+            WTE_SyncConfigToReadablePlaces();   // 连同 bg.png 一起铺进键盘容器
             WTE_NotifyChanged();
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf reloadSpecifiers];
                 UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已设置"
-                                                                          message:@"背景图已保存并生效"
+                                                                          message:@"背景图已裁成键盘比例并写入键盘（需注销一次生效）"
                                                                    preferredStyle:UIAlertControllerStyleAlert];
                 [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
                 [weakSelf presentViewController:a animated:YES completion:nil];
@@ -646,8 +661,13 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
 - (UIImage *)cropToKeyboardAspect:(UIImage *)image {
     CGSize sz = image.size;
     if (sz.width <= 0 || sz.height <= 0) return image;
-    // 键盘约 2.6 : 1（宽:高）
-    CGFloat targetRatio = 2.6;
+    // 键盘可视区域 ≈ 屏宽 × (屏高 * 0.30)。按当前设备动态算比例，
+    // 再夹到 1.2 ~ 2.0，避免极端机型出怪比例。
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat kbH = scr.height * 0.30;
+    CGFloat targetRatio = (kbH > 0) ? (scr.width / kbH) : 1.5;
+    targetRatio = MIN(2.0, MAX(1.2, targetRatio));
+
     CGFloat curRatio = sz.width / sz.height;
     CGRect rect;
     if (curRatio > targetRatio) {
@@ -664,6 +684,19 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     if (!cg) return image;
     UIImage *out = [UIImage imageWithCGImage:cg scale:scale orientation:image.imageOrientation];
     CGImageRelease(cg);
+
+    // 限宽 1400px，避免相册原图把 plist/容器塞爆
+    CGFloat maxW = 1400.0;
+    if (out.size.width > maxW) {
+        CGFloat newH = out.size.height * (maxW / out.size.width);
+        UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+        f.scale = 1.0;
+        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc]
+                                      initWithSize:CGSizeMake(maxW, newH) format:f];
+        out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            [out drawInRect:CGRectMake(0, 0, maxW, newH)];
+        }];
+    }
     return out;
 }
 

@@ -353,9 +353,12 @@ static void WTE_DiagFlush(NSString *tag) {}
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *useImg = nil;
-    for (NSString *p in @[@"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png",
+    // 优先键盘扩展自己容器里的（面板/中继铺进来的，唯一确定读得到的通道）
+    for (NSString *p in @[[NSString stringWithFormat:@"%@/Documents/WeTypeEnhance/bg.png", NSHomeDirectory()],
+                          [NSString stringWithFormat:@"%@/tmp/WeTypeEnhance/bg.png", NSHomeDirectory()],
+                          @"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png",
                           @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/bg.png"]) {
-        if ([fm fileExistsAtPath:p]) { useImg = p; break; }
+        if (p.length && [fm fileExistsAtPath:p]) { useImg = p; break; }
     }
     if (useImg) {
         c.bgImage = [UIImage imageWithContentsOfFile:useImg];
@@ -711,6 +714,16 @@ static void WTE_ApplyBarOrCandidate(UIView *self, WTEConfig *c) {
     }
 }
 
+// 是否已有「键盘容器」祖先 —— 背景只画在最外层，嵌套容器互相叠图层会花
+static BOOL WTE_HasKeyboardAncestor(UIView *v) {
+    UIView *p = v.superview;
+    while (p) {
+        if (WTE_NameIsKeyboard(NSStringFromClass([p class]))) return YES;
+        p = p.superview;
+    }
+    return NO;
+}
+
 // 统一入口：按类名特征分派
 static void WTE_ApplyToView(UIView *self) {
     WTEConfig *c = gConfig;
@@ -720,7 +733,7 @@ static void WTE_ApplyToView(UIView *self) {
     if (cls.length == 0) return;
 
     if (WTE_NameIsKeyboard(cls)) {
-        WTE_ApplyKeyboardBg(self, c);
+        if (!WTE_HasKeyboardAncestor(self)) WTE_ApplyKeyboardBg(self, c);
     } else if (WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls)) {
         WTE_ApplyBarOrCandidate(self, c);
     } else if (WTE_NameIsKey(cls)) {
@@ -829,17 +842,37 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
 }
 
 // 递归给子树里的键盘元素上色
+// 关键：微信输入法键盘的「可见底色」往往不在 WBKeyboardView 本身，
+// 而是中间那些不带 WB 前缀的子视图自己画的背景 / 毛玻璃层 ——
+// 不清掉它们，容器上画的背景永远被盖住（1.7.1 键盘背景完全不生效的根因）。
 static void WTE_ApplySubtree(UIView *root, int depth) {
     if (!root || depth > 8) return;
+    WTEConfig *c = gConfig;
+    // 需要中间层「让位」：开了背景（纯色/图片）或开了整键盘透明
+    BOOL clearMiddle = c && (c.bgEnabled || c.keyboardTransparent ||
+                             [c.bgMode isEqualToString:@"transparent"]);
     for (UIView *sub in [root.subviews copy]) {
         @try {
             NSString *cls = NSStringFromClass([sub class]);
-            if (WTE_NameIsKeyboard(cls) || WTE_NameIsKey(cls) ||
-                WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls)) {
+            BOOL isKey   = WTE_NameIsKey(cls);
+            BOOL isBar   = WTE_NameIsCandidate(cls) || WTE_NameIsBar(cls);
+            BOOL isKB    = WTE_NameIsKeyboard(cls);
+            if (isKB || isKey || isBar) {
                 WTE_ApplyToView(sub);
+            } else if (clearMiddle) {
+                // 非键盘元素的中间层：清底色 + 去毛玻璃，让容器背景透出来
+                sub.backgroundColor = [UIColor clearColor];
+                sub.opaque = NO;
+                if ([sub isKindOfClass:[UIVisualEffectView class]]) {
+                    ((UIVisualEffectView *)sub).effect = nil;
+                }
+                SEL sfx = NSSelectorFromString(@"setBackgroundEffects:");
+                if ([sub respondsToSelector:sfx]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(sub, sfx, nil);
+                }
             }
+            WTE_ApplySubtree(sub, depth + 1);
         } @catch (__unused NSException *e) {}
-        WTE_ApplySubtree(sub, depth + 1);
     }
 }
 
@@ -1103,7 +1136,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.7.1 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.7.2 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

@@ -162,5 +162,29 @@ NSArray *WTE_SyncConfigToReadablePlaces(void) {
         if (![fm fileExistsAtPath:dir]) continue;
         if ([src writeToFile:dest atomically:YES]) [ok addObject:dest];
     }
+
+    // ---- 背景图也要一起送进容器（键盘沙盒读不到全局路径） ----
+    NSString *bgSrc = nil;
+    for (NSString *cand in @[@"/var/mobile/Library/Application Support/WeTypeEnhance/bg.png",
+                             @"/var/jb/var/mobile/Library/Application Support/WeTypeEnhance/bg.png"]) {
+        if ([fm fileExistsAtPath:cand]) { bgSrc = cand; break; }
+    }
+    if (bgSrc) {
+        NSData *bg = [NSData dataWithContentsOfFile:bgSrc];
+        if (bg.length) {
+            for (NSString *base in WTEP_ContainersMatching(@"/var/mobile/Containers/Data/PluginKitPlugin", kws)) {
+                for (NSString *rel in @[@"Documents/WeTypeEnhance/bg.png",
+                                        @"tmp/WeTypeEnhance/bg.png"]) {
+                    NSString *dest = [base stringByAppendingPathComponent:rel];
+                    NSString *dir = [dest stringByDeletingLastPathComponent];
+                    if (![fm fileExistsAtPath:dir]) {
+                        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    }
+                    if (![fm fileExistsAtPath:dir]) continue;
+                    if ([bg writeToFile:dest atomically:YES]) [ok addObject:dest];
+                }
+            }
+        }
+    }
     return ok;
 }
