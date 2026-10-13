@@ -298,6 +298,7 @@ static void WTE_DumpTree(UIView *v, int depth, NSMutableString *out) {
 // 诊断用小工具（实现在下面的「透明底清理」一节，这里先声明）
 static void WTE_CollectViewLayers(UIView *v, NSMutableSet *set, int depth);
 static int  WTE_CountDecorationSublayers(UIView *v, NSSet *viewLayers);
+static NSString *WTE_DecorationLayerNames(UIView *v, NSSet *viewLayers, int maxN);
 
 // 这里不用 UIColor 的私有方法，只走公开的 getRed/green/blue/alpha
 static void WTE_DiagColorRGBA(UIColor *col, CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
@@ -415,7 +416,10 @@ static void WTE_DumpPaintCensus(UIView *kb, NSMutableString *out) {
         if (a > 0.02) [why addObject:[NSString stringWithFormat:@"bg(%.2f,%.2f,%.2f,%.2f)", r, g, b, a]];
         if (v.layer.contents) [why addObject:@"contents"];
         int deco = WTE_CountDecorationSublayers(v, viewLayers);
-        if (deco > 0) [why addObject:[NSString stringWithFormat:@"装饰子层×%d", deco]];
+        if (deco > 0) {
+            [why addObject:[NSString stringWithFormat:@"装饰子层×%d[%@]", deco,
+                            WTE_DecorationLayerNames(v, viewLayers, 3)]];
+        }
         if ([v isKindOfClass:[UIVisualEffectView class]] && ((UIVisualEffectView *)v).effect) {
             [why addObject:@"毛玻璃"];
         }
@@ -895,6 +899,19 @@ static int WTE_CountDecorationSublayers(UIView *v, NSSet *viewLayers) {
     return n;
 }
 
+// 装饰层的类名（诊断用：CATextLayer / CAGradientLayer / CALayer …）
+static NSString *WTE_DecorationLayerNames(UIView *v, NSSet *viewLayers, int maxN) {
+    if (!v || !viewLayers) return @"";
+    NSMutableArray *a = [NSMutableArray array];
+    for (CALayer *sl in v.layer.sublayers) {
+        NSValue *pv = [NSValue valueWithPointer:(__bridge const void *)(sl)];
+        if ([viewLayers containsObject:pv]) continue;
+        [a addObject:NSStringFromClass([sl class])];
+        if ((int)a.count >= maxN) break;
+    }
+    return [a componentsJoinedByString:@"/"];
+}
+
 // 抹掉一个图层身上的滤镜（毛玻璃材质就是这么来的）。
 // filters / backgroundFilters 在 iOS 的 CALayer 上不是公开属性，所以走 KVC + @try。
 static void WTE_ClearLayerFilters(UIView *v) {
@@ -930,6 +947,75 @@ static void WTE_StripDecorationSublayers(UIView *v, NSSet *viewLayers) {
     }
 }
 
+// ═══════════ v1.8.6：键盘容器自己身上的装饰层（★ 真凶） ═══════════
+//
+// v1.8.5 的「底板普查」给出了判决性证据：清完所有东西之后，整个窗口里
+// 唯一「满屏尺寸 + 还能画东西」的就是这一行 ——
+//
+//     WBRootInputView f(0,0,430,251) → 装饰子层×1   ←【键盘容器本身】
+//
+// 这就是微信输入法的渐变底色：它既不是视图、也不是 backgroundColor，
+// 而是挂在【键盘容器图层】上的一个装饰性 CALayer。
+//
+// 为什么之前所有修法都打不中它 —— CALayer 的绘制顺序是：
+//     backgroundColor  →  contents  →  sublayers  →  border
+// 装饰子层画在 backgroundColor 【之上】：
+//   · 纯色模式盖不住它（只能叠色 → 看起来像"渐变"，其实是我们的颜色 + 它的渐变）
+//   · 透明底也清不掉它（我们一直清的只是 backgroundColor）
+// 这也解释了用户那句「纯色模式是渐变，还挺好看」和 bg alpha=0.39 时的效果。
+
+// 一个子层是不是「某个视图的层」？UIKit 会把视图图层的 delegate 设成视图自己。
+// 装饰层的 delegate 一般是 nil，或者是别人 —— 用它就能把两类层精确分开。
+static BOOL WTE_IsViewBackedLayer(CALayer *l) {
+    if (!l) return NO;
+    @try {
+        id d = l.delegate;
+        if ([d isKindOfClass:[UIView class]] && ((UIView *)d).layer == l) return YES;
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
+// 只在这种【结构性容器】上清装饰层。
+// 按键 / 候选词单元格 / 文字 / 图标一律不碰 —— 那些是人要看的"皮"。
+static BOOL WTE_IsStructuralContainerClass(NSString *cls) {
+    static NSArray *names = nil;
+    if (!names) {
+        names = @[@"WBRootInputView", @"WBMainInputView", @"WBKeyboardView",
+                  @"WBT26Panel", @"WBTopBar", @"WBArrangeView",
+                  @"WBCustomToolBarView", @"WBFunctionToolBar",
+                  @"WBCandidateView", @"WBPlusEntranceView", @"WBTopBarTipsView"];
+    }
+    for (NSString *n in names) {
+        if ([cls isEqualToString:n]) return YES;
+    }
+    return NO;
+}
+
+// 把键盘容器子树里「结构性容器」图层上的装饰子层全部摘掉。
+// 返回摘掉的数量，方便诊断。
+static int WTE_StripContainerDecorations(UIView *root, int depth) {
+    if (!root || depth > 6) return 0;
+    int n = 0;
+    @try {
+        NSString *cls = NSStringFromClass([root class]);
+        if (WTE_IsStructuralContainerClass(cls)) {
+            for (CALayer *sl in [root.layer.sublayers copy]) {
+                if (WTE_IsViewBackedLayer(sl)) continue;   // 视图自己的层，绝不能动
+                @try {
+                    WTE_Diag(@"    [strip] %@ 上的装饰层 %@ bounds=%@ opacity=%.2f hidden=%d",
+                             cls, NSStringFromClass([sl class]),
+                             NSStringFromCGRect(sl.bounds), sl.opacity, sl.hidden ? 1 : 0);
+                    sl.hidden = YES;
+                    [sl removeFromSuperlayer];
+                    n++;
+                } @catch (__unused NSException *e) {}
+            }
+        }
+        for (UIView *s in [root.subviews copy]) n += WTE_StripContainerDecorations(s, depth + 1);
+    } @catch (__unused NSException *e) {}
+    return n;
+}
+
 // 窗口级兜底清扫：把整棵窗口树里「大面积 + 无内容」的纯背景层全清掉，
 // 但【绝不进键盘容器 kb 的子树】—— 那里面是字母、图标、候选词。
 static void WTE_ClearWindowBackgrounds(UIView *kb) {
@@ -959,6 +1045,54 @@ static void WTE_ClearWindowBackgrounds(UIView *kb) {
                 [stack addObject:s];                     // 有内容 → 只往下找，不动它
             }
         }
+    }
+}
+
+// ★★ v1.8.6 主枪口：键盘容器【自己图层】上的装饰子层 ★★
+//
+// 底板普查（v1.8.5 加的那个）给出的判决性证据：
+//   WBRootInputView f(0,0,430,251) → 装饰子层×1   ←【键盘容器本身】
+// 清完所有东西后，整个窗口里唯一「满屏尺寸 + 还能画东西」的就它一个。
+//
+// 这就是微信输入法的渐变底色：既不是视图、也不是 backgroundColor，
+// 而是挂在键盘容器图层上的一个装饰性 CALayer（CAGradientLayer 之类）。
+//
+// 为什么之前所有修法都打不中它 —— CALayer 绘制顺序：
+//     backgroundColor  →  contents  →  sublayers  →  border
+// 装饰子层画在 backgroundColor 【之上】：
+//   · 纯色模式盖不住它（只能叠色 → 看起来像"渐变"）
+//   · 透明底也清不掉它（我们一直清的只是 backgroundColor）
+//
+// 两种模式都摘：
+//   · 透明底 → 它走了，键盘才真的透
+//   · 纯色   → 我们的颜色才是真·纯色，而不是被它的渐变叠出来的"假渐变"
+// 这同时也是一次自证实验：如果摘完纯色模式还是渐变，说明渐变不在容器上。
+static const void *kWTEStripOnceKey = &kWTEStripOnceKey;
+
+static void WTE_StripContainerDecorationsOnce(UIView *kb) {
+    if (!kb) return;
+    NSUInteger token = (NSUInteger)(uintptr_t)gConfig;
+    NSMutableSet *seen = objc_getAssociatedObject(kb, kWTEStripOnceKey);
+    if (seen && [seen containsObject:@(token)]) return;   // 本配置已摘过
+
+    int n = WTE_StripContainerDecorations(kb, 0);
+    WTE_Diag(@"=== 键盘容器装饰层：摘掉 %d 个 ===", n);
+
+    if (!seen) seen = [NSMutableSet new];
+    [seen addObject:@(token)];
+    objc_setAssociatedObject(kb, kWTEStripOnceKey, seen, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // 输入法可能在布局过程中又把装饰层加回来 —— 在【非布局时机】补摘几次。
+    // （必须在 dispatch_after 里做：如果在 layoutSubviews 里反复摘层，会形成回环 → 卡死）
+    __weak UIView *weakKB = kb;
+    for (NSNumber *d in @[@0.30, @0.90, @1.80]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIView *k = weakKB;
+            if (!k || !gConfig) return;
+            int n2 = WTE_StripContainerDecorations(k, 0);
+            if (n2 > 0) WTE_Diag(@"=== 补摘装饰层 %d 个（输入法又加回来了）===", n2);
+        });
     }
 }
 
@@ -1095,6 +1229,11 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
     // 背景一律走 backgroundColor（+ 清中间层），零视图树改动、零 Layer 内容切换。
     CALayer *layer = self.layer;
     if (layer.contents) layer.contents = nil;   // 清掉旧版本可能残留的背景图
+
+    // ★★ v1.8.6 主枪口：摘掉键盘容器图层上的装饰子层（微信输入法的渐变底就在这里）★★
+    // 它画在 backgroundColor【之上】，纯色盖不住、透明清不掉 —— 之前所有修法都打不中它。
+    // 两种模式都摘：透明底才能真正透出去；纯色才是真·纯色（不再是被它叠出来的假渐变）。
+    WTE_StripContainerDecorationsOnce(self);
 
     if (solidBg) {
         WTE_SetBackground(self, [c.bgColor colorWithAlphaComponent:c.bgAlpha]);
@@ -1898,7 +2037,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.5 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.6 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

@@ -6,7 +6,7 @@
     CFBundleInfoDictionaryVersion = "6.0";
     CFBundleName = "微信输入法增强";
     CFBundlePackageType = "BNDL";
-    CFBundleShortVersionString = "1.8.5";
-    CFBundleVersion = "1.8.5";
+    CFBundleShortVersionString = "1.8.6";
+    CFBundleVersion = "1.8.6";
     NSPrincipalClass = "WTERootListController";
 }
