@@ -463,6 +463,7 @@ static void WTE_DiagFlush(NSString *tag) {}
 @property (nonatomic, strong) UIColor  *bgColor;
 @property (nonatomic, assign) double    bgAlpha;
 @property (nonatomic, assign) BOOL keyboardTransparent;
+@property (nonatomic, copy)   NSString *transScope;   // bg / all
 
 @property (nonatomic, assign) BOOL keyColorEnabled;
 @property (nonatomic, strong) UIColor *keyLetterBg;
@@ -536,6 +537,9 @@ static void WTE_DiagFlush(NSString *tag) {}
     c.bgAlpha             = WTE_DoublePref(kKeyBgAlpha, 1.0);
     // 「整键盘透明」并入背景模式：mode=transparent 即透明底
     c.keyboardTransparent = [c.bgMode isEqualToString:@"transparent"];
+    // v1.8.7 透明范围：bg = 只透底板（按键保留白帽） / all = 整键盘透明（按键帽也摘掉）
+    c.transScope = WTE_StringPref(kKeyTransScope, @"all");
+    if (![c.transScope isEqualToString:@"bg"]) c.transScope = @"all";
 
     c.keyColorEnabled   = WTE_BoolPref(kKeyKeyColorEnabled, NO);
     c.keyLetterBg       = WTE_ColorFromHex(WTE_StringPref(kKeyKeyLetterBg, @"#FFFFFF"));
@@ -991,14 +995,16 @@ static BOOL WTE_IsStructuralContainerClass(NSString *cls) {
     return NO;
 }
 
-// 把键盘容器子树里「结构性容器」图层上的装饰子层全部摘掉。
+// 把键盘容器子树里的装饰子层摘掉。
+//   scope = @"bg"  → 只摘【结构性容器】上的（按键帽保留，透明底板）
+//   scope = @"all" → 整棵键盘子树全摘（按键的白帽也摘 → 整键盘透明）
 // 返回摘掉的数量，方便诊断。
-static int WTE_StripContainerDecorations(UIView *root, int depth) {
-    if (!root || depth > 6) return 0;
+static int WTE_StripContainerDecorations(UIView *root, int depth, BOOL allViews) {
+    if (!root || depth > 8) return 0;
     int n = 0;
     @try {
         NSString *cls = NSStringFromClass([root class]);
-        if (WTE_IsStructuralContainerClass(cls)) {
+        if (allViews || WTE_IsStructuralContainerClass(cls)) {
             for (CALayer *sl in [root.layer.sublayers copy]) {
                 if (WTE_IsViewBackedLayer(sl)) continue;   // 视图自己的层，绝不能动
                 @try {
@@ -1011,7 +1017,7 @@ static int WTE_StripContainerDecorations(UIView *root, int depth) {
                 } @catch (__unused NSException *e) {}
             }
         }
-        for (UIView *s in [root.subviews copy]) n += WTE_StripContainerDecorations(s, depth + 1);
+        for (UIView *s in [root.subviews copy]) n += WTE_StripContainerDecorations(s, depth + 1, allViews);
     } @catch (__unused NSException *e) {}
     return n;
 }
@@ -1075,8 +1081,9 @@ static void WTE_StripContainerDecorationsOnce(UIView *kb) {
     NSMutableSet *seen = objc_getAssociatedObject(kb, kWTEStripOnceKey);
     if (seen && [seen containsObject:@(token)]) return;   // 本配置已摘过
 
-    int n = WTE_StripContainerDecorations(kb, 0);
-    WTE_Diag(@"=== 键盘容器装饰层：摘掉 %d 个 ===", n);
+    int n = WTE_StripContainerDecorations(kb, 0,
+             [gConfig.transScope isEqualToString:@"all"]);
+    WTE_Diag(@"=== 键盘装饰层：摘掉 %d 个（范围=%@）===", n, gConfig.transScope ?: @"all");
 
     if (!seen) seen = [NSMutableSet new];
     [seen addObject:@(token)];
@@ -1090,7 +1097,8 @@ static void WTE_StripContainerDecorationsOnce(UIView *kb) {
                        dispatch_get_main_queue(), ^{
             UIView *k = weakKB;
             if (!k || !gConfig) return;
-            int n2 = WTE_StripContainerDecorations(k, 0);
+            int n2 = WTE_StripContainerDecorations(k, 0,
+                     [gConfig.transScope isEqualToString:@"all"]);
             if (n2 > 0) WTE_Diag(@"=== 补摘装饰层 %d 个（输入法又加回来了）===", n2);
         });
     }
@@ -2037,7 +2045,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.6 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.7 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

@@ -26,6 +26,8 @@
 #define kKeyBgAlpha            @"bgAlpha"
 #define kKeyBgImageData        @"bgImageData"
 #define kKeyKeyboardTransparent @"keyboardTransparent"
+// v1.8.7：透明底的范围  bg = 只透底板（按键保留原样） / all = 整键盘透明（按键帽也摘掉）
+#define kKeyTransScope         @"transScope"
 
 // 2. 按键配色
 #define kKeyKeyColorEnabled    @"keyColorEnabled"
