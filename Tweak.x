@@ -449,6 +449,43 @@ static void WTE_DumpPaintCensus(UIView *kb, NSMutableString *out) {
                           "    ⇒ 底色来自【进程外 / 系统侧合成】，必须走「注入宿主 App」路线）\n"];
     }
 }
+
+// —— 收集宿主 App 的回执（v1.8.8）——
+// 宿主 App 被沙盒关在自己容器里，写不了 /var/mobile/Media（v1.8.7 报告已证实），
+// 只能各写自己容器里的 host.txt。键盘扩展这边去 Application 容器里把它们捞出来 ——
+// 这是验证「过滤规则到底有没有把宿主 App 也注入到」的唯一通道：
+//   · 捞到了 → 注入成功，问题在「清得不够」（那就看它清掉了哪些视图）
+//   · 捞不到 → 过滤规则没铺开，得换注入写法（跟 v1.8.8 的清理逻辑无关）
+static void WTE_DumpHostReports(NSMutableString *out) {
+    if (!out) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *bases = @[@"/var/mobile/Containers/Data/Application",
+                       @"/var/mobile/Containers/Data/PluginKitPlugin"];
+    int files = 0;
+    for (NSString *base in bases) {
+        NSArray *subs = [fm contentsOfDirectoryAtPath:base error:nil];
+        if (!subs.count) {
+            [out appendFormat:@"  宿主回执：%@ 列不出来（沙盒挡住）\n", base];
+            continue;
+        }
+        for (NSString *sub in subs) {
+            if (files >= 8) break;
+            NSString *f = [[base stringByAppendingPathComponent:sub]
+                           stringByAppendingPathComponent:@"Documents/WeTypeEnhance/host.txt"];
+            if (![fm fileExistsAtPath:f]) continue;
+            NSString *txt = [NSString stringWithContentsOfFile:f
+                                                      encoding:NSUTF8StringEncoding error:nil];
+            if (!txt.length) continue;
+            files++;
+            if (txt.length > 3000) txt = [txt substringFromIndex:txt.length - 3000];
+            [out appendFormat:@"\n----- 宿主回执 #%d %@ -----\n%@\n", files, f, txt];
+        }
+    }
+    if (files == 0) {
+        [out appendString:@"  （一处都没捞到 ⇒ 宿主 App 侧没被注入，或沙盒挡住了；\n"
+                         "    若地址列不出来 = 沙盒挡住，得改用别的取证方式）\n"];
+    }
+}
 #else
 #define WTE_Diag(...) do {} while (0)
 static void WTE_DiagFlush(NSString *tag) {}
@@ -1563,6 +1600,9 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                                 WTE_DumpTree(kb, 0, dump);
                                 WTE_DumpAncestors(kb, dump);
                                 WTE_DumpPaintCensus(kb, dump);
+                                [dump appendString:
+                                    @"\n===== 宿主 App 回执（宿主侧清理有没有铺开）=====\n"];
+                                WTE_DumpHostReports(dump);
                                 WTE_Diag(@"%@", dump);
                                 WTE_DiagFlush(@"tree");
                             } @catch (__unused NSException *e) {}
@@ -1798,101 +1838,212 @@ static void WTE_RelayNotifyCallback(CFNotificationCenterRef center, void *observ
 
 #pragma mark - ========== 宿主 App 侧：清掉键盘在宿主机里的那层底 ==========
 //
-// v1.8.5 新增，专门兜住「扩展进程里已经全透明、人却还能看见底色」的情况。
+// ★ v1.8.8：这一节是整个「真·透明」的正面战场 ★
 //
-// 第三方键盘的界面是【远程】渲染的：扩展进程里的 _UIHostedWindow 只是一层壳，
-// 真正把键盘显示到屏幕上的窗口（UIRemoteKeyboardWindow → UIInputSetContainerView
-// → UIInputSetHostView）存在于【宿主 App 的进程】里。系统有可能在那里垫一层
-// 键盘底色 —— 那层我们在扩展进程里无论怎么清都碰不到，因为根本不在同一个进程。
+// v1.8.7 的诊断把结论钉死了：
+//   · 键盘扩展【自己进程的整棵窗口树】已经清到一个能画底色的视图都没有（底板普查为空），
+//     祖先链最外层是 _UIHostedWindow；
+//   · 可屏幕上键盘区域依然是一整片系统灰。
+//   ⇒ 那片灰根本不在扩展进程里。
 //
-// 做法（刻意保守）：
+// 第三方键盘真正的「显示位置」在【宿主 App 进程】：
+//     UIRemoteKeyboardWindow → UIInputSetContainerView → UIInputSetHostView
+// 扩展的内容是通过远程视图合成进这一支的。iOS 在这几级容器上垫的那层键盘底板，
+// 扩展进程无论怎么清都碰不到 —— 这就是「透明底一直不生效」的最终根因。
+//
+// v1.8.8 的做法：让插件也注入宿主 App（过滤规则里列了一批常用 App），
+// 键盘一弹出来就在【宿主进程】里把键盘窗口那一支清干净。
+//
+// 三条纪律：
 //   · 绝不 hook 任何 layoutSubviews —— 宿主 App 里挂布局 hook 一旦形成布局反馈
-//     死循环，就是「微信整个卡死」，代价太大。
-//   · 只在「键盘将要弹出 / 已经弹出」的通知里，延迟几个时间点清一次属性。
-//     通知驱动的写字操作不会自我触发，零死循环风险。
-//   · 只在透明底模式做工（配置从宿主自己容器里的那份 relay 副本读）。
-// ⚠️ 只认「键盘窗口」这几个类名，绝不放 _UIHostedWindow / UIHostingView ——
-//    那两个在宿主里可能被小程序之类的东西用着，清它会有副作用。
+//     死循环，就是「微信整个卡死」，代价太大。只靠「键盘将要弹出 / 已经弹出」
+//     通知 + 延迟几个时间点动手；通知驱动的写字操作不会自我触发，零死循环风险。
+//   · 只在【键盘窗口】那一支里动手（树里找不到 UIInputSetHostView 的窗口一律跳过），
+//     绝不扫 App 自己的界面 —— 不可能把用户的 App 搞透明。
+//   · 一旦在键盘窗口里看到原生键盘的自绘部件（Keyplane / KeyView / KeyboardDock）
+//     就整体跳过 —— 密码框等场景 iOS 会强制切回原生键盘，绝不能把原生键盘也弄透明。
 static NSArray<NSString *> *WTE_HostBackdropClasses(void) {
-    return @[@"UIRemoteKeyboardWindow", @"UIInputSetContainerView",
-             @"UIInputSetHostView", @"UIKeyboardHostView"];
+    static NSArray *a = nil;
+    if (!a) a = @[@"UIRemoteKeyboardWindow", @"UIInputSetContainerView",
+                  @"UIInputSetHostView", @"UIKeyboardHostView",
+                  @"_UIKeyboardHostView"];
+    return a;
 }
 
-static BOOL WTE_HostWantsTransparent(void) {
+// —— 宿主侧「回执」——
+// 宿主 App 被沙盒关在自己容器里，写不了 /var/mobile/Media（v1.8.7 的报告已证实
+// 连键盘扩展都写不进去）。所以每个宿主 App 各写自己容器里的一份 host.txt；
+// 键盘扩展那边会去 Application 容器里把这些回执捞出来塞进 diag.txt，
+// 这就是验证「过滤规则到底有没有把宿主 App 也注入到」的唯一通道。
+static void WTE_HostAppendReport(NSString *text) {
+    if (!text.length) return;
     @try {
-        NSDictionary *d = nil;
-        NSString *p = WTEPref_HomePath(@"Documents/WeTypeEnhance/config.plist");
-        if (p) d = [NSDictionary dictionaryWithContentsOfFile:p];
-        if (![d isKindOfClass:[NSDictionary class]] || d.count == 0) {
-            d = [NSDictionary dictionaryWithContentsOfFile:
-                 [NSHomeDirectory() stringByAppendingPathComponent:
-                  @"Library/Preferences/com.colorblack.wetypeenhance.plist"]];
+        NSString *home = NSHomeDirectory();
+        if (!home.length) return;
+        NSString *dir = [home stringByAppendingPathComponent:@"Documents/WeTypeEnhance"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         }
-        if (![d isKindOfClass:[NSDictionary class]]) return NO;
-        id v = d[@"bgMode"];
-        return ([v isKindOfClass:[NSString class]] && [v isEqualToString:@"transparent"]);
-    } @catch (__unused NSException *e) { return NO; }
+        NSString *f = [dir stringByAppendingPathComponent:@"host.txt"];
+        NSString *old = [NSString stringWithContentsOfFile:f encoding:NSUTF8StringEncoding error:nil] ?: @"";
+        if (old.length > 150000) old = @"";     // 防膨胀
+        [([old stringByAppendingFormat:@"%@\n", text])
+            writeToFile:f atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (__unused NSException *e) {}
 }
 
-static void WTE_HostSweepView(UIView *v, NSSet *viewLayers, int depth) {
-    if (!v || depth > 14) return;
-    for (UIView *s in [v.subviews copy]) {
-        @try {
-            NSString *cls = NSStringFromClass([s class]);
-            for (NSString *n in WTE_HostBackdropClasses()) {
-                if ([cls isEqualToString:n]) {
-                    WTE_ClearLayerPaint(s);
-                    WTE_ClearLayerFilters(s);
-                    WTE_StripDecorationSublayers(s, viewLayers);
-                    if (s.opaque) s.opaque = NO;
-                    break;
-                }
-            }
-        } @catch (__unused NSException *e) {}
-        WTE_HostSweepView(s, viewLayers, depth + 1);
+// 宿主进程里，键盘窗口这一支是不是「原生键盘自绘」？
+// 苹果原生键盘的按键平面就在进程内，一旦看到 Keyplane / KeyView 就说明是原生键盘，
+// 绝不能动它的底板，否则连原生键盘都会变透明。
+// 第三方键盘在宿主进程里只有一个远程视图外壳，不会有这些部件。
+static BOOL WTE_HostTreeLooksLikeSystemKeyboard(UIView *root) {
+    if (!root) return NO;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard < 1500) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in v.subviews) [stack addObject:s];
+        NSString *n = NSStringFromClass([v class]);
+        if ([n containsString:@"Keyplane"] || [n containsString:@"KeyView"] ||
+            [n containsString:@"KeyboardDock"] || [n containsString:@"KeyCap"] ||
+            [n hasPrefix:@"UIKBKey"]) return YES;
     }
+    return NO;
 }
 
-static void WTE_HostClearKeyboardBackdrop(void) {
-    @try {
-        NSArray *wins = nil;
-        @try {
-            Class appCls = NSClassFromString(@"UIApplication");
-            id app = ((id (*)(id, SEL))objc_msgSend)(appCls, NSSelectorFromString(@"sharedApplication"));
-            wins = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
-        } @catch (__unused NSException *e) {}
-        if (![wins isKindOfClass:[NSArray class]] || wins.count == 0) return;
+// 在窗口树里找「输入集宿主视图」—— 有它就说明这个窗口是键盘窗口。
+static UIView *WTE_HostFindInputSetHost(UIView *root, int depth) {
+    if (!root || depth > 12) return nil;
+    NSString *n = NSStringFromClass([root class]);
+    if ([n isEqualToString:@"UIInputSetHostView"] ||
+        [n isEqualToString:@"UIKeyboardHostView"] ||
+        [n isEqualToString:@"_UIKeyboardHostView"]) return root;
+    for (UIView *s in root.subviews) {
+        UIView *r = WTE_HostFindInputSetHost(s, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
 
-        NSMutableSet *viewLayers = [NSMutableSet set];
-        for (UIWindow *w in wins) WTE_CollectViewLayers(w, viewLayers, 0);
+static NSArray<UIWindow *> *WTE_HostAllWindows(void) {
+    @try {
+        Class appCls = NSClassFromString(@"UIApplication");
+        if (!appCls) return @[];
+        id app = ((id (*)(id, SEL))objc_msgSend)(appCls, NSSelectorFromString(@"sharedApplication"));
+        if (!app) return @[];
+        NSArray *wins = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
+        if (![wins isKindOfClass:[NSArray class]]) return @[];
+        NSMutableArray *out = [NSMutableArray array];
+        for (id w in wins) {
+            if ([w isKindOfClass:[UIWindow class]]) [out addObject:w];
+        }
+        return out;
+    } @catch (__unused NSException *e) { return @[]; }
+}
+
+// 清一棵【键盘窗口】子树里所有能画出底色的东西。
+// 这棵树整个都属于键盘，可以放心清；唯一要避开的是文字 / 图标（人手要看的）。
+// 返回清掉的视图数。
+static int WTE_HostSweepTree(UIView *root, NSMutableString *log, int *logged) {
+    if (!root) return 0;
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    WTE_CollectViewLayers(root, viewLayers, 0);
+
+    CGSize rs = root.bounds.size;
+    CGFloat rootArea = rs.width * rs.height;
+
+    int cleared = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard < 4000) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in [v.subviews copy]) [stack addObject:s];
+
+        // 文字和图标绝不动（那是键盘的内容）
+        if ([v isKindOfClass:[UILabel class]]) continue;
+        if ([v isKindOfClass:[UIImageView class]]) continue;
+
+        NSString *cls = NSStringFromClass([v class]);
+        BOOL isBackdrop = NO;
+        for (NSString *n in WTE_HostBackdropClasses()) {
+            if ([cls isEqualToString:n]) { isBackdrop = YES; break; }
+        }
+
+        CGFloat area = v.bounds.size.width * v.bounds.size.height;
+        BOOL big = (rootArea > 1.0 && area >= rootArea * 0.20);
+        BOOL effect = ([v isKindOfClass:[UIVisualEffectView class]] &&
+                       ((UIVisualEffectView *)v).effect != nil);
+        BOOL needClear = isBackdrop || effect || (big && !WTE_SubtreeHasContent(v, 0));
+        if (!needClear) continue;
+
+        WTE_ClearLayerPaint(v);
+        WTE_ClearLayerFilters(v);
+        WTE_StripDecorationSublayers(v, viewLayers);
+        if (v.opaque) v.opaque = NO;
+        cleared++;
+        if (log && logged && *logged < 40) {
+            (*logged)++;
+            [log appendFormat:@"  [host-clear] %@ f(%.0f,%.0f,%.0f,%.0f) 容器=%d 毛玻璃=%d\n",
+             cls, v.frame.origin.x, v.frame.origin.y,
+             v.frame.size.width, v.frame.size.height,
+             isBackdrop ? 1 : 0, effect ? 1 : 0];
+        }
+    }
+    return cleared;
+}
+
+// 一次宿主侧清扫：遍历所有窗口，只动「键盘窗口」那一支。
+// writeLog = YES 时把结果写进本 App 容器里的 host.txt（回执）。
+static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
+    @try {
+        NSArray<UIWindow *> *wins = WTE_HostAllWindows();
+        if (!wins.count) return;
+
+        NSMutableString *log = [NSMutableString string];
+        int logged = 0, touched = 0, total = 0;
+
         for (UIWindow *w in wins) {
-            // 宿主侧的键盘窗口自己也可能是那层底
-            for (NSString *n in WTE_HostBackdropClasses()) {
-                if ([NSStringFromClass([w class]) isEqualToString:n]) {
-                    WTE_ClearLayerPaint(w);
-                    WTE_ClearLayerFilters(w);
-                    if (w.opaque) w.opaque = NO;
-                    break;
-                }
+            if (!WTE_HostFindInputSetHost(w, 0)) continue;    // 不是键盘窗口 → 跳过
+            if (WTE_HostTreeLooksLikeSystemKeyboard(w)) {     // 原生键盘 → 一根手指都不碰
+                if (writeLog) [log appendFormat:@"  [skip] %@：识别为原生键盘\n",
+                                                NSStringFromClass([w class])];
+                continue;
             }
-            WTE_HostSweepView(w, viewLayers, 0);
+            touched++;
+            total += WTE_HostSweepTree(w, log, &logged);
+        }
+
+        if (writeLog && touched > 0) {
+            NSMutableString *head = [NSMutableString stringWithFormat:
+                @"[host] bundle=%@ pid=%d 键盘窗口=%d 清掉视图=%d time=%@\n",
+                [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
+                getpid(), touched, total, [NSDate date]];
+            [head appendString:log];
+            WTE_HostAppendReport(head);
         }
     } @catch (__unused NSException *e) {}
 }
 
 // 键盘动画期间 UIKeyboardWillChangeFrame 会狂发（每帧一条）。
 // 不做节流的话，每一次都要遍历整个宿主 App 的窗口树 —— 微信会被拖卡。
-// 这里 0.45 秒内只放行一批。（本函数总在主线程被调用，无需加锁）
+// 这里 0.35 秒内只放行一批。（本函数总在主线程被调用，无需加锁）
 static NSTimeInterval gHostLastSweepAt = 0;
+
 static void WTE_HostScheduleSweeps(void) {
     NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    if (now - gHostLastSweepAt < 0.45) return;
+    if (now - gHostLastSweepAt < 0.35) return;
     gHostLastSweepAt = now;
-    // 键盘弹出是个动画过程，窗口和子视图是逐步建好的 —— 多打几个时间点。
-    for (NSNumber *d in @[@0.05, @0.35, @0.90]) {
+    // 键盘弹出是个动画过程：窗口和子视图是逐步建好的；第三方键盘扩展冷启动
+    // 可能超过 1 秒。多打几个时间点，最后一个压到 2.8 秒。
+    for (NSNumber *d in @[@0.05, @0.25, @0.50, @0.90, @1.40, @2.00, @2.80]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (WTE_HostWantsTransparent()) WTE_HostClearKeyboardBackdrop();
+            WTE_HostClearKeyboardBackdrop(d.doubleValue >= 0.50 && d.doubleValue <= 2.00);
         });
     }
 }
@@ -1908,6 +2059,15 @@ static void WTE_InstallHostKeyboardSweep(void) {
                 WTE_HostScheduleSweeps();
             }];
         }
+        // 回执：证明本进程确实被注入了，并记下进程里有没有键盘容器类。
+        // 拿不到任何回执 ⇒ 过滤规则没把宿主 App 注入到，问题在下发层不在代码。
+        WTE_HostAppendReport([NSString stringWithFormat:
+            @"[host] 注入成功 bundle=%@ exec=%@ pid=%d 有键盘容器类=%d time=%@\n",
+            [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
+            [[NSProcessInfo processInfo] processName] ?: @"?",
+            getpid(),
+            (NSClassFromString(@"UIInputSetHostView") ? 1 : 0),
+            [NSDate date]]);
         NSLog(@"[WeTypeEnhance][host] 宿主侧键盘背景清理已就绪 (%@)",
               [[NSBundle mainBundle] bundleIdentifier]);
     } @catch (__unused NSException *e) {}
@@ -2008,6 +2168,10 @@ static void WTE_Init(void) {
         BOOL ok2 = [msg writeToFile:[ownDir stringByAppendingPathComponent:@"springboard.txt"]
                          atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSLog(@"[WeTypeEnhance] SpringBoard 对照写入 Media=%d container=%d", ok1, ok2);
+
+        // v1.8.8：SpringBoard 也可能是「宿主」—— 启动器/搜索页是 SpringBoard 进程画的，
+        // 键盘就弹在 SpringBoard 进程里。系统垫的键盘灰底同样要清。
+        WTE_InstallHostKeyboardSweep();
         return;
     }
 
@@ -2026,13 +2190,11 @@ static void WTE_Init(void) {
         }
     }
     if (!isWeType) {
-        // —— 宿主 App 侧通道（v1.8.5）——
+        // —— 宿主 App 侧通道（v1.8.5 起，v1.8.8 全面铺开）——
         // 不是微信输入法自己的进程，但如果是 App（有 UIApplication），
         // 就在这里挂「键盘弹出 → 清掉键盘窗口背景」的清扫。
-        // 这一步只碰系统那几个键盘容器类，绝不装键盘视图 hook，绝不 hook 布局。
-        if (NSClassFromString(@"UIApplication")) {
-            WTE_InstallHostKeyboardSweep();
-        }
+        // 这一步只碰【键盘窗口】那一支，绝不装键盘视图 hook，绝不 hook 布局。
+        WTE_InstallHostKeyboardSweep();
         return;
     }
 
@@ -2045,7 +2207,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.7 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.8 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

@@ -10,21 +10,43 @@
 <dict>
     <key>Filter</key>
     <dict>
+        <!-- v1.8.8：宿主 App 侧清扫 —— 必须把插件也注入到「会弹键盘的宿主 App」。
+             第三方键盘真正的显示位置在宿主 App 进程里：
+                 UIRemoteKeyboardWindow → UIInputSetContainerView → UIInputSetHostView
+             系统在那几级容器上垫的键盘底板，扩展进程无论怎么清都碰不到
+             （v1.8.7 的底板普查为空就是铁证）。所以这里把常用的宿主 App 都列上。
+
+             ⚠️ 刻意【不】用 Classes/Mode 这种「按类名全量注入」的写法：
+                roothide 的注入层对过滤键的默认语义与 libhooker 未必完全一致，
+                万一 Mode 默认是 All（与），一个类名没匹配上就会让整个插件
+                在所有进程都不注入 —— 代价太大。Bundles 是已被证明可用的写法，
+                先保证「一定注入」，覆盖面后面再扩。 -->
         <key>Bundles</key>
         <array>
-            <!-- 键盘扩展本体（主体逻辑在这里） -->
+            <!-- 键盘扩展本体：主体逻辑在这里 -->
             <string>com.tencent.wetype.keyboard</string>
             <string>com.tencent.xin.keyboard</string>
             <string>com.tencent.wetype</string>
-            <!-- 阳性对照 + 配置中继（SpringBoard 无沙盒） -->
+            <!-- 阳性对照 + 偏好中继 -->
             <string>com.apple.springboard</string>
-            <!-- v1.8.5：宿主 App 侧。第三方键盘真正的窗口
-                 （UIRemoteKeyboardWindow / UIInputSetHostView）在宿主进程里，
-                 系统若在那里垫了一层键盘底色，只有注入宿主才清得掉。
-                 这些进程里【只挂键盘弹出通知驱动的清扫】，不装任何键盘视图 hook。 -->
+            <!-- 宿主 App：键盘窗口就在这些进程里，透明底必须靠它们 -->
             <string>com.tencent.xin</string>
             <string>com.tencent.wework</string>
+            <string>com.tencent.mqq</string>
+            <string>com.tencent.mobileqq</string>
             <string>com.apple.mobilesafari</string>
+            <string>com.apple.Preferences</string>
+            <string>com.apple.mobilenotes</string>
+            <string>com.apple.MobileSMS</string>
+            <string>com.apple.mobilemail</string>
+            <string>com.apple.mobilecal</string>
+            <string>com.alipay.iphoneclient</string>
+            <string>com.taobao.taobao4iphone</string>
+            <string>com.taobao.taobao</string>
+            <string>com.ss.iphone.ugc.Aweme</string>
+            <string>com.xingin.discover</string>
+            <string>com.sina.weibo</string>
+            <string>com.google.chrome.ios</string>
         </array>
         <key>Executables</key>
         <array>
