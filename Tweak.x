@@ -2008,8 +2008,18 @@ static void WTE_HostClearKeyboardBackdrop(BOOL writeLog) {
         int logged = 0, touched = 0, total = 0;
 
         for (UIWindow *w in wins) {
-            if (!WTE_HostFindInputSetHost(w, 0)) continue;    // 不是键盘窗口 → 跳过
-            if (WTE_HostTreeLooksLikeSystemKeyboard(w)) {     // 原生键盘 → 一根手指都不碰
+            // 判据一：窗口树里能找到「输入集宿主视图」—— 最精确
+            BOOL isKbWin = (WTE_HostFindInputSetHost(w, 0) != nil);
+            // 判据二（兜底）：窗口类名本身就是键盘窗口。
+            // 万一某个 iOS 版本把 UIInputSetHostView 换了名字，判据一会失效，
+            // 但这两个类名是键盘窗口的固定标识，而且这种窗口里只有键盘那一支。
+            if (!isKbWin) {
+                NSString *wn = NSStringFromClass([w class]);
+                if ([wn containsString:@"RemoteKeyboard"] || [wn containsString:@"KeyboardWindow"])
+                    isKbWin = YES;
+            }
+            if (!isKbWin) continue;                            // 不是键盘窗口 → 跳过
+            if (WTE_HostTreeLooksLikeSystemKeyboard(w)) {       // 原生键盘 → 一根手指都不碰
                 if (writeLog) [log appendFormat:@"  [skip] %@：识别为原生键盘\n",
                                                 NSStringFromClass([w class])];
                 continue;
