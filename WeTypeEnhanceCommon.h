@@ -28,6 +28,9 @@
 #define kKeyKeyboardTransparent @"keyboardTransparent"
 // v1.8.7：透明底的范围  bg = 只透底板（按键保留原样） / all = 整键盘透明（按键帽也摘掉）
 #define kKeyTransScope         @"transScope"
+// v1.9.0：按键透明度滑动条（只在透明底模式起作用）
+//   1.0 = 不透明（默认，打字最清楚）；0.0 = 完全透明（只剩字母）
+#define kKeyKeyOpacity         @"keyOpacity"
 
 // 2. 按键配色
 #define kKeyKeyColorEnabled    @"keyColorEnabled"

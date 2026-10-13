@@ -216,6 +216,15 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     return [PSSpecifier groupSpecifierWithName:name];
 }
 
+// v1.9.0：带说明文字的分组（footerText 会渲染在这一组所有行的下方）
+- (PSSpecifier *)group:(NSString *)name footer:(NSString *)footer {
+    PSSpecifier *s = [PSSpecifier groupSpecifierWithName:name];
+    if (footer.length) {
+        @try { [s setProperty:footer forKey:@"footerText"]; } @catch (__unused id e) {}
+    }
+    return s;
+}
+
 - (PSSpecifier *)switchRow:(NSString *)title key:(NSString *)key def:(BOOL)def {
     PSSpecifier *s = [PSSpecifier preferenceSpecifierNamed:title
                                                     target:self
@@ -323,7 +332,10 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     [specs addObject:[self switchRow:@"启用" key:kKeyEnabled def:YES]];
 
     // ---- 1. 键盘背景（v1.8.0：只保留 纯色 / 透明底） ----
-    [specs addObject:[self group:@"键盘背景"]];
+    [specs addObject:[self group:@"键盘背景"
+        footer:@"【透明底】＝ 把键盘自己的底板清空，透出聊天背景（就像微信自带的表情面板那样）。"
+               "【按键透明度】只在透明底下生效：1.0＝不透明（打字最清楚，默认，不影响打字）；"
+               "往左拉按键跟着变透明，能透过按键看到背景；拉到 0 只剩字母，可能不好找按键。"]];
     [specs addObject:[self switchRow:@"开启背景" key:kKeyBgEnabled def:NO]];
     [specs addObject:[self choiceRow:@"背景模式" key:kKeyBgMode def:@"solid"
                               values:@[@"solid", @"transparent"]
@@ -333,6 +345,9 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     [specs addObject:[self choiceRow:@"透明范围" key:kKeyTransScope def:@"bg"
                               values:@[@"bg", @"all"]
                               titles:@[@"只透底板（按键正常，推荐）", @"整键盘透明（按键半透明）"]]];
+    // v1.9.0：按键透明度滑动条 —— 默认 1.0，完全不影响打字
+    [specs addObject:[self sliderRow:@"按键透明度 (1=不透明 0=全透)"
+                                key:kKeyKeyOpacity def:1.0 min:0.0 max:1.0]];
     [specs addObject:[self colorRow:@"背景颜色" key:kKeyBgColor def:@"#101826"]];
     [specs addObject:[self sliderRow:@"背景不透明度" key:kKeyBgAlpha def:1.0 min:0.0 max:1.0]];
 

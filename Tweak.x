@@ -486,6 +486,86 @@ static void WTE_DumpHostReports(NSMutableString *out) {
                          "    若地址列不出来 = 沙盒挡住，得改用别的取证方式）\n"];
     }
 }
+
+// —— v1.9.0：把本进程【所有窗口】都列出来 ——
+// 之前的普查只看 kb.window。万一输入法自己开了第二个窗口垫底色，我们永远扫不到。
+static void WTE_DumpAllWindows(NSMutableString *out) {
+    if (!out) return;
+    NSArray *wins = nil;
+    @try {
+        Class appCls = NSClassFromString(@"UIApplication");
+        if (!appCls) return;
+        id app = ((id (*)(id, SEL))objc_msgSend)(appCls, NSSelectorFromString(@"sharedApplication"));
+        wins = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
+    } @catch (__unused NSException *e) { return; }
+    if (![wins isKindOfClass:[NSArray class]]) return;
+
+    [out appendFormat:@"\n===== 本进程共 %lu 个窗口 =====\n", (unsigned long)wins.count];
+    for (id o in wins) {
+        if (![o isKindOfClass:[UIWindow class]]) continue;
+        UIWindow *w = (UIWindow *)o;
+        CGFloat r = 0, g = 0, b = 0, a = 0;
+        WTE_DiagColorRGBA(w.backgroundColor, &r, &g, &b, &a);
+        [out appendFormat:@"  %@ f(%.0f,%.0f,%.0f,%.0f) bg(%.2f,%.2f,%.2f,%.2f) "
+                          @"hidden=%d alpha=%.2f op=%d 子视图=%lu 层子层=%lu\n",
+         NSStringFromClass([w class]),
+         w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height,
+         r, g, b, a, w.hidden ? 1 : 0, w.alpha, w.isOpaque ? 1 : 0,
+         (unsigned long)w.subviews.count, (unsigned long)w.layer.sublayers.count];
+    }
+}
+
+// —— v1.9.0：透明自检（判决性实验）——
+// 光看视图树猜不出谁在画底色，那就直接【渲染成位图、数不透明像素】：
+//   ① 整个窗口原样渲染           → 键盘本来就画着按键，占比高是正常的
+//   ② 把键盘容器藏掉再渲染一次    → 剩下的就是「键盘内容之外」的底色
+//      · ≈0%  ⇒ 本进程窗口除了键盘内容什么都没画 ⇒ 底色 100% 在宿主 App 进程
+//      · >0%  ⇒ 本进程窗口里还有别的东西在画底色 ⇒ 看窗口列表 + 普查去抓它
+// （hidden 的改动在同一个 RunLoop 里恢复，不会真的闪一帧）
+static double WTE_RenderOpaqueRatio(UIView *v) {
+    if (!v) return -1;
+    CGSize size = v.bounds.size;
+    if (size.width < 8 || size.height < 8) return -1;
+    NSInteger W = 32, H = 20;
+    unsigned char *buf = (unsigned char *)malloc((size_t)(W * H * 4));
+    if (!buf) return -1;
+    memset(buf, 0, (size_t)(W * H * 4));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef c = CGBitmapContextCreate(buf, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!c) { free(buf); return -1; }
+    CGContextScaleCTM(c, (CGFloat)W / size.width, (CGFloat)H / size.height);
+    @try {
+        [v drawViewHierarchyInRect:CGRectMake(0, 0, size.width, size.height)
+                afterScreenUpdates:NO];
+    } @catch (__unused NSException *e) { CGContextRelease(c); free(buf); return -1; }
+    CGContextRelease(c);
+    long opaque = 0, total = W * H;
+    for (long i = 0; i < total; i++) if (buf[i * 4 + 3] > 24) opaque++;
+    free(buf);
+    return (double)opaque / (double)total;
+}
+
+static void WTE_TransparentSelfTest(UIView *kb, NSMutableString *out) {
+    if (!kb || !kb.window || !out) return;
+    double rAll = WTE_RenderOpaqueRatio(kb.window);
+    BOOL wasHidden = kb.hidden;
+    kb.hidden = YES;
+    double rBg = WTE_RenderOpaqueRatio(kb.window);
+    kb.hidden = wasHidden;
+
+    [out appendString:@"\n===== 透明自检（把窗口渲染成位图数不透明像素）=====\n"];
+    if (rAll < 0 || rBg < 0) { [out appendString:@"  （渲染失败，本机不支持采样）\n"]; return; }
+    [out appendFormat:@"  ① 整个窗口原样渲染       不透明占比 %5.1f%%（按键本来就不透明，正常）\n", rAll * 100];
+    [out appendFormat:@"  ② 藏掉键盘容器后再渲染    不透明占比 %5.1f%%\n", rBg * 100];
+    if (rBg < 0.02) {
+        [out appendString:@"  ⇒ 判决：本进程窗口除了键盘内容【什么都没画】\n"
+                          "    剩下的底色 100% 来自宿主 App 进程 —— 看上面的「宿主回执」确认注入有没有铺开\n"];
+    } else {
+        [out appendString:@"  ⇒ 判决：本进程窗口里【还有别的东西在画底色】！\n"
+                          "    拿上面的「窗口列表」和「底板普查」对，找出那个大面积的层\n"];
+    }
+}
 #else
 #define WTE_Diag(...) do {} while (0)
 static void WTE_DiagFlush(NSString *tag) {}
@@ -501,6 +581,7 @@ static void WTE_DiagFlush(NSString *tag) {}
 @property (nonatomic, assign) double    bgAlpha;
 @property (nonatomic, assign) BOOL keyboardTransparent;
 @property (nonatomic, copy)   NSString *transScope;   // bg / all
+@property (nonatomic, assign) double    keyOpacity;   // v1.9.0 按键透明度（透明底模式专用）
 
 @property (nonatomic, assign) BOOL keyColorEnabled;
 @property (nonatomic, strong) UIColor *keyLetterBg;
@@ -580,6 +661,12 @@ static void WTE_DiagFlush(NSString *tag) {}
     c.transScope = WTE_StringPref(kKeyTransScope, @"bg");
     if (![c.transScope isEqualToString:@"bg"] && ![c.transScope isEqualToString:@"all"])
         c.transScope = @"bg";
+
+    // v1.9.0 按键透明度：1.0 = 不透明（默认，打字最清楚），0 = 完全透明。
+    // 只在透明底模式下生效，越界值一律夹回 [0,1]。
+    c.keyOpacity = WTE_DoublePref(kKeyKeyOpacity, 1.0);
+    if (!(c.keyOpacity >= 0.0)) c.keyOpacity = 0.0;
+    if (c.keyOpacity > 1.0)     c.keyOpacity = 1.0;
 
     c.keyColorEnabled   = WTE_BoolPref(kKeyKeyColorEnabled, NO);
     c.keyLetterBg       = WTE_ColorFromHex(WTE_StringPref(kKeyKeyLetterBg, @"#FFFFFF"));
@@ -1162,6 +1249,54 @@ static void WTE_HidePureBackdropLeaves(UIView *kb) {
     if (hid) WTE_Diag(@"=== 藏掉 %d 个纯背景叶子（drawRect: 类底色只能藏不能清）===", hid);
 }
 
+// ═══════════ v1.9.0：本进程【所有窗口】逐个清一遍 ═══════════
+//
+// 之前的普查和清理都只盯 kb.window。万一输入法自己开了第二个窗口垫底色，
+// 我们永远扫不到它 —— 底板普查当然是空的，屏幕上却还是有底色。
+// 键盘扩展进程里的每个窗口都属于键盘本身，清了不会伤到别人。
+static void WTE_ClearAllExtensionWindows(UIView *kb) {
+    if (!kb) return;
+    NSArray *wins = nil;
+    @try {
+        Class appCls = NSClassFromString(@"UIApplication");
+        if (!appCls) return;
+        id app = ((id (*)(id, SEL))objc_msgSend)(appCls, NSSelectorFromString(@"sharedApplication"));
+        wins = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
+    } @catch (__unused NSException *e) { return; }
+    if (![wins isKindOfClass:[NSArray class]]) return;
+
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    for (id o in wins) {
+        if ([o isKindOfClass:[UIWindow class]]) WTE_CollectViewLayers((UIWindow *)o, viewLayers, 0);
+    }
+
+    int touched = 0;
+    for (id o in wins) {
+        if (![o isKindOfClass:[UIWindow class]]) continue;
+        UIWindow *w = (UIWindow *)o;
+        if (w == kb.window) continue;                    // kb.window 祖先链里已经清过
+        WTE_ClearLayerPaint(w);
+        WTE_ClearLayerFilters(w);
+        WTE_StripDecorationSublayers(w, viewLayers);
+        if (w.opaque) w.opaque = NO;
+        touched++;
+        WTE_Diag(@"[allwin] 额外窗口 %@ f(%0.f,%0.f,%0.f,%0.f) 子视图=%lu 已清",
+                 NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y,
+                 w.frame.size.width, w.frame.size.height, (unsigned long)w.subviews.count);
+
+        CGFloat area = w.bounds.size.width * w.bounds.size.height;
+        if (area <= 1.0) continue;
+        for (UIView *s in [w.subviews copy]) {
+            CGFloat sa = s.bounds.size.width * s.bounds.size.height;
+            if (sa >= area * 0.35 && !WTE_SubtreeHasContent(s, 0)) {
+                WTE_ClearLayerPaintDeep(s);
+                WTE_ClearLayerFilters(s);
+                WTE_StripDecorationSublayers(s, viewLayers);
+            }
+        }
+    }
+}
+
 // ★★ v1.8.6 主枪口：键盘容器【自己图层】上的装饰子层 ★★
 //
 // 底板普查（v1.8.5 加的那个）给出的判决性证据：
@@ -1387,6 +1522,9 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
         // ★ v1.8.9：drawRect: 类底色的最后一枪 —— 整个藏掉
         WTE_HidePureBackdropLeaves(self);
 
+        // ★ v1.9.0：本进程其它窗口也一并清掉（防「第二个窗口垫底色」）
+        WTE_ClearAllExtensionWindows(self);
+
         // ★ v1.8.5：UIInputView 的系统键盘背景（backgroundEffects / inputViewStyle）
         //   这一项不是视图，视图树快照看不到，是「全清了还有底色」的头号嫌疑。
 #if WTE_LOG_ENABLE
@@ -1415,20 +1553,17 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
 static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
     WTEKeyKind kind = WTE_KeyKindForView(self);
 
-    // ★ v1.8.9：「整键盘透明」时按键帽改成【半透明】而不是摘掉 ★
-    //   v1.8.8 把按键帽整个摘了 → 用户「打字很容易按不到字母」。
-    //   半透明帽子既能让背后的聊天背景透出来，又看得清按键在哪，
-    //   可点击区域一点没变。用户自己开了「按键配色」的话，以用户的为准。
-    if (!c.keyColorEnabled && (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])
-        && [c.transScope isEqualToString:@"all"]) {
-        CGColorRef cur = self.backgroundColor.CGColor;
-        CGFloat a = cur ? CGColorGetAlpha(cur) : 1.0;
-        if (a > 0.60) {   // 原本接近不透明才改，别把本来就很透的越改越透
-            WTE_SetBackground(self, [UIColor colorWithWhite:1.0 alpha:0.45]);
-        }
+    // ★ v1.9.0：「按键透明度」滑动条 ★（只在透明底模式起作用）
+    //   1.0 = 不透明（默认 → 打字完全不受影响，也就是用户要的「透明但不影响打字」）
+    //   0.0 = 完全透明（只剩字母，透过按键能直接看到聊天背景）
+    //   与「透明范围」独立：就算选「只透底板」，把滑条拉低也能让按键透。
+    //   用户自己开了「按键配色」的话，以用户的配色为准。
+    if (!c.keyColorEnabled && c.keyOpacity < 0.995
+        && (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])) {
+        WTE_SetBackground(self, [UIColor colorWithWhite:1.0 alpha:c.keyOpacity]);
         for (CALayer *sl in [self.layer.sublayers copy]) {
-            if (WTE_IsViewBackedLayer(sl)) continue;       // 视图自己的层不动
-            if (sl.opacity > 0.90) sl.opacity = 0.45;      // 按键帽 → 半透明
+            if (WTE_IsViewBackedLayer(sl)) continue;              // 视图自己的层不动
+            if (fabs(sl.opacity - c.keyOpacity) > 0.01) sl.opacity = (float)c.keyOpacity;
         }
     }
 
@@ -1711,6 +1846,8 @@ static void WTE_LayoutReplacement(UIView *self, SEL _cmd) {
                                 [dump appendString:
                                     @"\n===== 宿主 App 回执（宿主侧清理有没有铺开）=====\n"];
                                 WTE_DumpHostReports(dump);
+                                WTE_DumpAllWindows(dump);
+                                WTE_TransparentSelfTest(kb, dump);
                                 WTE_Diag(@"%@", dump);
                                 WTE_DiagFlush(@"tree");
                             } @catch (__unused NSException *e) {}
@@ -2325,7 +2462,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.9 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.9.0 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {
