@@ -575,8 +575,11 @@ static void WTE_DiagFlush(NSString *tag) {}
     // 「整键盘透明」并入背景模式：mode=transparent 即透明底
     c.keyboardTransparent = [c.bgMode isEqualToString:@"transparent"];
     // v1.8.7 透明范围：bg = 只透底板（按键保留白帽） / all = 整键盘透明（按键帽也摘掉）
-    c.transScope = WTE_StringPref(kKeyTransScope, @"all");
-    if (![c.transScope isEqualToString:@"bg"]) c.transScope = @"all";
+    // v1.8.9 默认改回 bg：整键盘透明会把按键帽摘掉/改透，用户实测「打字按不到字母」。
+    // 想要更透的效果自己去面板切「整键盘透明」（按键会变半透明，仍可见）。
+    c.transScope = WTE_StringPref(kKeyTransScope, @"bg");
+    if (![c.transScope isEqualToString:@"bg"] && ![c.transScope isEqualToString:@"all"])
+        c.transScope = @"bg";
 
     c.keyColorEnabled   = WTE_BoolPref(kKeyKeyColorEnabled, NO);
     c.keyLetterBg       = WTE_ColorFromHex(WTE_StringPref(kKeyKeyLetterBg, @"#FFFFFF"));
@@ -1034,14 +1037,21 @@ static BOOL WTE_IsStructuralContainerClass(NSString *cls) {
 
 // 把键盘容器子树里的装饰子层摘掉。
 //   scope = @"bg"  → 只摘【结构性容器】上的（按键帽保留，透明底板）
-//   scope = @"all" → 整棵键盘子树全摘（按键的白帽也摘 → 整键盘透明）
+//   scope = @"all" → 整棵键盘子树都摘，【但按键除外】（见下）
 // 返回摘掉的数量，方便诊断。
 static int WTE_StripContainerDecorations(UIView *root, int depth, BOOL allViews) {
     if (!root || depth > 8) return 0;
     int n = 0;
     @try {
         NSString *cls = NSStringFromClass([root class]);
-        if (allViews || WTE_IsStructuralContainerClass(cls)) {
+        // ★ v1.8.9：按键【绝不摘】装饰层 ★
+        //   v1.8.7/1.8.8 在「整键盘透明」时把按键帽的装饰层也摘了，
+        //   结果按键变得几乎看不见 → 用户「打字很容易按不到字母」。
+        //   按键帽的半透明改由 WTE_ApplyKeyAppearance 用 layer.opacity 实现：
+        //   帽子还在（形状/位置/可点击区域都不变），只是变透明。
+        BOOL isKey = WTE_NameIsKey(cls);
+        BOOL target = isKey ? NO : (allViews || WTE_IsStructuralContainerClass(cls));
+        if (target) {
             for (CALayer *sl in [root.layer.sublayers copy]) {
                 if (WTE_IsViewBackedLayer(sl)) continue;   // 视图自己的层，绝不能动
                 @try {
@@ -1089,6 +1099,67 @@ static void WTE_ClearWindowBackgrounds(UIView *kb) {
             }
         }
     }
+}
+
+// ═══════════ v1.8.9：最后一类「清不掉」的底 —— 用 drawRect: 画出来的纯背景叶子 ═══════════
+//
+// backgroundColor / layer.contents / 装饰层 / 滤镜全都不是它 —— 它是把底色直接画进
+// backing store 的。对这种视图，清是清不掉的：UIKit 下一次 display 会重画回来
+// （这正是「清完普查为空、屏幕上却还有底色」的最可能解释）。
+//
+// 唯一可靠的办法是【整个藏掉】。安全边界画得很死：
+//   · 只藏【叶子】（没有子视图）→ 不可能连带藏掉别人的内容
+//   · 只藏面积 ≥ 键盘 60% 的        → 键帽、图标、候选词都远小于这个
+//   · 只藏「真的画了东西」的         → 底色 / contents / 装饰层 至少占一样
+//   · UILabel / UIImageView 一律跳过 → 文字和图标绝不动
+// 按键有文字或图标，永远命中不了 —— 不会出现「按不到字母」。
+static const void *kWTEHideLeafKey = &kWTEHideLeafKey;
+
+static void WTE_HidePureBackdropLeaves(UIView *kb) {
+    if (!kb) return;
+    UIWindow *w = kb.window;
+    if (!w) return;
+    CGFloat kbArea = kb.bounds.size.width * kb.bounds.size.height;
+    if (kbArea <= 1.0) return;
+    NSUInteger token = (NSUInteger)(uintptr_t)gConfig;
+
+    NSMutableSet *viewLayers = [NSMutableSet set];
+    WTE_CollectViewLayers(w, viewLayers, 0);
+
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+    int guard = 0, hid = 0;
+    while (stack.count > 0 && guard < 3000) {
+        guard++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in [v.subviews copy]) [stack addObject:s];
+
+        if (v == kb) continue;
+        if (v.subviews.count > 0) continue;                     // 不是叶子
+        if ([v isKindOfClass:[UILabel class]]) continue;
+        if ([v isKindOfClass:[UIImageView class]]) continue;
+        CGFloat area = v.bounds.size.width * v.bounds.size.height;
+        if (area < kbArea * 0.60) continue;                     // 不够大，不是底板
+
+        BOOL paints = NO;
+        CGColorRef cg = v.backgroundColor.CGColor;
+        if (cg && CGColorGetAlpha(cg) > 0.02) paints = YES;
+        if (v.layer.contents) paints = YES;
+        if (WTE_CountDecorationSublayers(v, viewLayers) > 0) paints = YES;
+        if (!paints) continue;                                  // 什么都不画，别动它
+
+        NSNumber *prev = objc_getAssociatedObject(v, kWTEHideLeafKey);
+        if (prev && prev.unsignedIntegerValue == token) continue;
+        objc_setAssociatedObject(v, kWTEHideLeafKey, @(token), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!v.hidden) {
+            v.hidden = YES;
+            hid++;
+            WTE_Diag(@"[hide] 纯背景叶子 %@ f(%.0f,%.0f,%.0f,%.0f)",
+                     NSStringFromClass([v class]),
+                     v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height);
+        }
+    }
+    if (hid) WTE_Diag(@"=== 藏掉 %d 个纯背景叶子（drawRect: 类底色只能藏不能清）===", hid);
 }
 
 // ★★ v1.8.6 主枪口：键盘容器【自己图层】上的装饰子层 ★★
@@ -1275,6 +1346,23 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
     CALayer *layer = self.layer;
     if (layer.contents) layer.contents = nil;   // 清掉旧版本可能残留的背景图
 
+#if WTE_LOG_ENABLE
+    // ★ v1.8.9 诊断：动手【前】先拍一张原始状态的快照（只拍一次）★
+    //   之前所有的快照都是「清完之后」拍的 —— 万一某个视图是用 drawRect: 画底，
+    //   我们清完 contents 它就会重画，普查看到的就是「干净的」假象。
+    //   有了这张原始快照，就能对比出「谁本来画着东西、清完又画回来了」。
+    static BOOL sPristineDumped = NO;
+    if (!sPristineDumped) {
+        sPristineDumped = YES;
+        NSMutableString *d = [NSMutableString stringWithString:
+            @"\n===== 【原始状态】动手之前的键盘视图树（只拍这一次）=====\n"];
+        WTE_DumpTree(self, 0, d);
+        WTE_DumpPaintCensus(self, d);
+        WTE_Diag(@"%@", d);
+        WTE_DiagFlush(@"pristine");
+    }
+#endif
+
     // ★★ v1.8.6 主枪口：摘掉键盘容器图层上的装饰子层（微信输入法的渐变底就在这里）★★
     // 它画在 backgroundColor【之上】，纯色盖不住、透明清不掉 —— 之前所有修法都打不中它。
     // 两种模式都摘：透明底才能真正透出去；纯色才是真·纯色（不再是被它叠出来的假渐变）。
@@ -1295,6 +1383,9 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
         //   证据：纯色模式能盖住它（说明它在下层），透明底一清空就露出来了。
         //   所以必须顺着祖先链往上清，否则永远透不出去。
         WTE_ClearKeyboardAncestors(self);
+
+        // ★ v1.8.9：drawRect: 类底色的最后一枪 —— 整个藏掉
+        WTE_HidePureBackdropLeaves(self);
 
         // ★ v1.8.5：UIInputView 的系统键盘背景（backgroundEffects / inputViewStyle）
         //   这一项不是视图，视图树快照看不到，是「全清了还有底色」的头号嫌疑。
@@ -1323,6 +1414,23 @@ static void WTE_ApplyKeyboardBg(UIView *self, WTEConfig *c) {
 
 static void WTE_ApplyKeyAppearance(UIView *self, WTEConfig *c) {
     WTEKeyKind kind = WTE_KeyKindForView(self);
+
+    // ★ v1.8.9：「整键盘透明」时按键帽改成【半透明】而不是摘掉 ★
+    //   v1.8.8 把按键帽整个摘了 → 用户「打字很容易按不到字母」。
+    //   半透明帽子既能让背后的聊天背景透出来，又看得清按键在哪，
+    //   可点击区域一点没变。用户自己开了「按键配色」的话，以用户的为准。
+    if (!c.keyColorEnabled && (c.keyboardTransparent || [c.bgMode isEqualToString:@"transparent"])
+        && [c.transScope isEqualToString:@"all"]) {
+        CGColorRef cur = self.backgroundColor.CGColor;
+        CGFloat a = cur ? CGColorGetAlpha(cur) : 1.0;
+        if (a > 0.60) {   // 原本接近不透明才改，别把本来就很透的越改越透
+            WTE_SetBackground(self, [UIColor colorWithWhite:1.0 alpha:0.45]);
+        }
+        for (CALayer *sl in [self.layer.sublayers copy]) {
+            if (WTE_IsViewBackedLayer(sl)) continue;       // 视图自己的层不动
+            if (sl.opacity > 0.90) sl.opacity = 0.45;      // 按键帽 → 半透明
+        }
+    }
 
     // 形状
     if ([c.keyShape isEqualToString:@"circle"]) {
@@ -2217,7 +2325,7 @@ static void WTE_Init(void) {
 
     WTE_ReloadConfig();
 
-    WTE_Diag(@"================ WeTypeEnhance v1.8.8 ================");
+    WTE_Diag(@"================ WeTypeEnhance v1.8.9 ================");
     WTE_Diag(@"pid=%d bundle=%@ exec=%@ home=%@", getpid(), bundleID, execName, NSHomeDirectory());
     WTE_Diag(@"--- 偏好通道逐个探测 ---");
     for (NSString *p in WTE_PrefCandidates()) {

@@ -328,11 +328,11 @@ static NSString *WTEP_FindSpringBoardMarker(void) {
     [specs addObject:[self choiceRow:@"背景模式" key:kKeyBgMode def:@"solid"
                               values:@[@"solid", @"transparent"]
                               titles:@[@"纯色", @"透明底"]]];
-    // v1.8.7：透明底到底透多少。默认「整键盘」—— 白键帽在白色页面上
-    // 看不出透明效果，全摘掉才能一眼确认；想要按键样子就切回「只透底板」。
-    [specs addObject:[self choiceRow:@"透明范围" key:kKeyTransScope def:@"all"
+    // v1.8.9：默认「只透底板」。整键盘透明会把按键帽改半透明 —— 1.8.7/1.8.8 直接摘掉，
+    // 用户实测「打字按不到字母」；1.8.9 起改成半透明帽，既透又看得见。
+    [specs addObject:[self choiceRow:@"透明范围" key:kKeyTransScope def:@"bg"
                               values:@[@"bg", @"all"]
-                              titles:@[@"只透底板（按键保留）", @"整键盘透明（按键也透）"]]];
+                              titles:@[@"只透底板（按键正常，推荐）", @"整键盘透明（按键半透明）"]]];
     [specs addObject:[self colorRow:@"背景颜色" key:kKeyBgColor def:@"#101826"]];
     [specs addObject:[self sliderRow:@"背景不透明度" key:kKeyBgAlpha def:1.0 min:0.0 max:1.0]];
 
